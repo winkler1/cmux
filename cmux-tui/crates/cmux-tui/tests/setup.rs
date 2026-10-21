@@ -866,7 +866,8 @@ fn cmux_setup_harness_an_agent_hands_the_person_the_sign_in_and_checks_again() {
             &json!("machine"),
             &json!("harness"),
             &json!("mcp"),
-            &json!("computer_use")
+            &json!("computer_use"),
+            &json!("notifications")
         ],
         "{status}"
     );
@@ -1179,9 +1180,12 @@ fn cmux_setup_mcp_replaces_a_moved_cmux_and_leaves_another_server_named_cmux() {
 /// person's sheet, approved while `approve` is set (true turns Computer Use
 /// on with the grants of `on`, false turns it off) and declined otherwise;
 /// `settings.get computerUse.enabled` reads the last approved value.
-/// Every request is kept.
+/// `notifications.status` answers `notifications`, and `notifications.request`
+/// is the macOS prompt: while not determined it turns authorized when
+/// `approve` is set, denied otherwise. Every request is kept.
 struct FakeApp {
     status: Arc<Mutex<Value>>,
+    notifications: Arc<Mutex<Value>>,
     approve: Arc<std::sync::atomic::AtomicBool>,
     enabled: Arc<std::sync::atomic::AtomicBool>,
     requests: Arc<Mutex<Vec<Value>>>,
@@ -1194,12 +1198,15 @@ impl FakeApp {
         world.app = Some(socket);
         let app = Self {
             status: Arc::new(Mutex::new(off.clone())),
+            notifications: Arc::new(Mutex::new(json!({"authorization": "not_determined",
+                "alert": false, "sound": false, "badge": false, "bundle_id": "com.cmuxterm.app"}))),
             approve: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             requests: Arc::new(Mutex::new(Vec::new())),
         };
         let (status, approve, enabled, requests) =
             (app.status.clone(), app.approve.clone(), app.enabled.clone(), app.requests.clone());
+        let notifications = app.notifications.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { break };
@@ -1212,6 +1219,19 @@ impl FakeApp {
                     let params = &request["params"];
                     let answer = match request["method"].as_str() {
                         Some("computer_use.status") => Ok(status.lock().unwrap().clone()),
+                        Some("notifications.status") => Ok(notifications.lock().unwrap().clone()),
+                        Some("notifications.request") => {
+                            let mut current = notifications.lock().unwrap();
+                            if current["authorization"] == "not_determined" {
+                                let allowed = approve.load(Ordering::SeqCst);
+                                current["authorization"] =
+                                    json!(if allowed { "authorized" } else { "denied" });
+                                for key in ["alert", "sound", "badge"] {
+                                    current[key] = json!(allowed);
+                                }
+                            }
+                            Ok(current.clone())
+                        }
                         Some("settings.get") if params["path"] == "computerUse.enabled" => {
                             Ok(json!({"value": enabled.load(Ordering::SeqCst)}))
                         }
@@ -1245,6 +1265,11 @@ impl FakeApp {
             }
         });
         app
+    }
+
+    /// How many requests for `method` the app received.
+    fn calls(&self, method: &str) -> usize {
+        self.requests.lock().unwrap().iter().filter(|r| r["method"] == method).count()
     }
 
     /// The `settings.set` params the app received, in order.
@@ -1372,4 +1397,101 @@ fn cmux_setup_computer_use_waits_when_the_phase_lags_the_ok() {
     let rerun = world.json(&["setup", "computer-use"]);
     assert_eq!(rerun["state"], "ok", "{rerun}");
     assert_eq!(app.settings_sets().len(), 1, "the rerun showed a second sheet");
+}
+
+/// Notifications driven the way an agent drives them: `status` names the
+/// task, a dry run asks nothing, the macOS prompt asks once and the person
+/// allows it, a rerun asks nothing, and the undo is the pane where the person
+/// turns them off. Denied (the prompt is spent), setup names the System
+/// Settings pane to open; declined on the prompt, the agent asks first.
+#[test]
+fn cmux_setup_notifications_asks_macos_once_and_names_the_pane_when_denied() {
+    const PANE: &str =
+        "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=com.cmuxterm.app";
+    let mut world = World::new("nt");
+    let off = json!({"phase": "ready", "accessibility": true, "screen_recording": true});
+    let app = FakeApp::start(&mut world, off.clone(), off.clone());
+
+    let status = world.json(&["setup", "status"]);
+    let check = &status["checks"][5];
+    assert_eq!(check["task"], "notifications", "{status}");
+    assert_eq!(check["state"], "needs_setup", "{check}");
+    let fix = check["fix"].as_str().expect("status names its fix").to_owned();
+    assert_eq!(fix, "cmux setup notifications");
+
+    let planned = world.json(&["setup", "notifications", "--dry-run"]);
+    assert_eq!(planned["state"], "planned", "{planned}");
+    assert_eq!(planned["undo"], format!("open '{PANE}'"), "{planned}");
+    assert_eq!(app.calls("notifications.request"), 0, "a dry run showed the prompt");
+
+    let allowed = world.follow(&fix);
+    assert_eq!(allowed["state"], "changed", "{allowed}");
+    assert_eq!(allowed["before"]["authorization"], "not_determined");
+    assert_eq!(allowed["after"]["authorization"], "authorized");
+    assert_eq!(allowed["undo"], format!("open '{PANE}'"), "{allowed}");
+    assert!(allowed["undo_note"].is_string(), "{allowed}");
+    assert_eq!(app.calls("notifications.request"), 1);
+
+    let rerun = world.json(&["setup", "notifications"]);
+    assert_eq!(rerun["state"], "ok", "{rerun}");
+    assert_eq!(rerun["undo"], Value::Null);
+    assert_eq!(app.calls("notifications.request"), 1, "an ok run showed the prompt");
+    assert_eq!(world.json(&["setup", "status"])["checks"][5]["state"], "ok");
+
+    // Turned off in System Settings: setup names the pane, and asks nothing.
+    app.notifications.lock().unwrap()["authorization"] = json!("denied");
+    let denied = world.json(&["setup", "notifications"]);
+    assert_eq!(denied["state"], "needs_user", "{denied}");
+    let action = &denied["user_action"];
+    assert_eq!(action["kind"], "grant", "{action}");
+    assert_eq!(action["command"], format!("open '{PANE}'"));
+    assert_eq!(action["url"], PANE);
+    assert_eq!(app.calls("notifications.request"), 1, "a denied run showed the prompt");
+    assert_eq!(world.json(&["setup", "status"])["checks"][5]["state"], "needs_user");
+
+    // The person says no on the prompt: nothing to undo, ask before again.
+    let mut world = World::new("ntno");
+    let app = FakeApp::start(&mut world, off.clone(), off);
+    app.approve.store(false, Ordering::SeqCst);
+    let declined = world.json(&["setup", "notifications"]);
+    assert_eq!(declined["state"], "needs_user", "{declined}");
+    assert_eq!(declined["user_action"]["kind"], "declined", "{declined}");
+    assert_eq!(declined["undo"], Value::Null);
+
+    let output = world.run(&["setup", "notifications", "now"]);
+    assert_eq!(output.status.code(), Some(2));
+}
+
+/// An app from before `notifications.status`: the person gets the pane.
+#[test]
+fn cmux_setup_notifications_names_an_older_app() {
+    let mut world = World::new("ntold");
+    let socket = world.home.parent().unwrap().join("old.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    world.app = Some(socket);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { break };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                let request: Value = serde_json::from_str(&line).unwrap();
+                line.clear();
+                let error = json!({"code": "method_not_found", "message": "unknown method"});
+                let response = json!({"id": request["id"], "ok": false, "error": error});
+                if writeln!(writer, "{response}").is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    let result = world.json(&["setup", "notifications"]);
+    assert_eq!(result["state"], "needs_user", "{result}");
+    assert_eq!(result["user_action"]["kind"], "app", "{result}");
+    assert_eq!(
+        result["user_action"]["command"],
+        "open 'x-apple.systempreferences:com.apple.Notifications-Settings.extension'",
+        "{result}"
+    );
 }

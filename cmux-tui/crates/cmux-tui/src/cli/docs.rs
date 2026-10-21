@@ -108,6 +108,7 @@ pub(super) const GUIDES: &[Guide] = &[
             "mcp",
             "computer",
             "grant",
+            "notifications",
         ],
         text: "`cmux setup list` names every setup task (folder trust, harness install and sign-in, \
         ssh machines, peer updates, accounts, Cloud machines, Tailscale, MCP wiring, Computer \
@@ -127,9 +128,11 @@ pub(super) const GUIDES: &[Guide] = &[
         person turns on `mcp.enabled` (\"mcp\": {\"enabled\": true}) in the settings file, \
         it writes nothing and names that switch. `cmux setup computer-use` turns Computer Use \
         on once the person allows it on the sheet cmux shows, and names each missing macOS \
-        grant with the command that opens its System Settings pane. `cmux setup status` lists \
-        every peer with connected and outdated, every harness, the MCP wiring and Computer \
-        Use. Every `cmux setup` command prints one JSON object: state is ok, changed, planned, \
+        grant with the command that opens its System Settings pane. `cmux setup notifications` \
+        lets cmux show macOS notifications: it shows the macOS prompt once, and once denied \
+        names the command that opens cmux's page in System Settings > Notifications. `cmux \
+        setup status` lists every peer with connected and outdated, every harness, the MCP \
+        wiring, Computer Use and notifications. Every `cmux setup` command prints one JSON object: state is ok, changed, planned, \
         needs_user or failed.",
     },
 ];

@@ -104,3 +104,10 @@ one.
   Kind `wait` means it is starting: run the task again in a few seconds.
   Kind `declined` means it was not allowed (they said no, or cmux had no
   window to show the sheet in): ask them before running it again.
+- Notifications: `cmux setup notifications` lets cmux show macOS
+  notifications. The first time, macOS shows its prompt (tell them to click
+  Allow). Kind `grant` means they are off in System Settings: run its
+  `command` to open cmux's page there and tell them to turn on Allow
+  Notifications. Kind `declined` means they said no: ask before running it
+  again. Which notifications show are settings: `cmux settings set
+  notifications.KEY VALUE`.
