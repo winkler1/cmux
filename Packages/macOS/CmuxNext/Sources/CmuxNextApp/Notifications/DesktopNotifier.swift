@@ -1,5 +1,6 @@
 import AppKit
 import CmuxNextAgentPane
+import CmuxNextControl
 import CmuxNextDesign
 import CmuxNextMobileHost
 import os
@@ -58,6 +59,8 @@ final class DesktopNotifier: NSObject {
     /// "automation" when this launch never asks.
     private(set) var authorization = DesktopNotifier.usesSystemCenter ? "unknown" : "automation"
     private var center: UNUserNotificationCenter?
+    /// Whether this launch asked for authorization (a banner or `notifications.request`).
+    private var askedAuthorization = false
     private let logger = Logger(subsystem: "com.cmuxterm.app.next", category: "notifications")
     private static let postedLimit = 32
 
@@ -153,7 +156,22 @@ final class DesktopNotifier: NSObject {
         return true
     }
 
+    /// The center for a banner: the first one asks for authorization.
     private func resolvedCenter() -> UNUserNotificationCenter? {
+        guard let center = configuredCenter() else { return nil }
+        // Asked once; a GUI job (NX_REMOTE=1, CMUX_TEST_REQUIRE_GUI=1) never asks: the banner catches its clicks.
+        if !askedAuthorization, !Self.isGUIJob {
+            askedAuthorization = true
+            center.requestAuthorization(options: [.alert, .sound, .badge]) { [weak self] granted, _ in
+                Task { @MainActor in self?.authorization = granted ? "authorized" : "denied" }
+            }
+        }
+        return center
+    }
+
+    /// The system center with this app's delegate and banner categories, made once; nil when
+    /// this launch never uses it (an automation launch, or not the main app bundle).
+    private func configuredCenter() -> UNUserNotificationCenter? {
         if let center { return center }
         guard Self.usesSystemCenter, Self.isMainAppBundle(bundleIdentifier: Bundle.main.bundleIdentifier, bundleURL: Bundle.main.bundleURL) else {
             return nil
@@ -163,13 +181,26 @@ final class DesktopNotifier: NSObject {
         center.setNotificationCategories([Self.defaultBannerCategory(), Self.replyBannerCategory(), AgentApprovalBanners.notificationCategory(),
                                           IPhonePairNotices.notificationCategory()])
         self.center = center
-        // Asked once (the center is cached); a GUI job (NX_REMOTE=1, CMUX_TEST_REQUIRE_GUI=1) never asks: the banner catches its clicks.
-        if !["NX_REMOTE", "CMUX_TEST_REQUIRE_GUI"].contains(where: { ProcessInfo.processInfo.environment[$0] == "1" }) {
-            center.requestAuthorization(options: [.alert, .sound, .badge]) { [weak self] granted, _ in
-                Task { @MainActor in self?.authorization = granted ? "authorized" : "denied" }
+        return center
+    }
+
+    nonisolated private static var isGUIJob: Bool {
+        ["NX_REMOTE", "CMUX_TEST_REQUIRE_GUI"].contains { ProcessInfo.processInfo.environment[$0] == "1" }
+    }
+
+    /// The permission `notifications.status` reads and `notifications.request` asks for, on the
+    /// banners' own center. A launch that never asks (an automation launch, a GUI job, not the
+    /// main app bundle) answers `unavailable`.
+    func permission() throws -> any NotificationPermissionCenter {
+        guard !Self.isGUIJob, configuredCenter() != nil else {
+            throw ControlError(code: "unavailable", message: NotificationPermissionStrings.unavailable)
+        }
+        return SystemNotificationPermission(bundleID: Bundle.main.bundleIdentifier) { [weak self] granted in
+            Task { @MainActor in
+                self?.askedAuthorization = true
+                self?.authorization = granted ? "authorized" : "denied"
             }
         }
-        return center
     }
 
     /// Reply banners' category: one text field whose Send types into the terminal.
