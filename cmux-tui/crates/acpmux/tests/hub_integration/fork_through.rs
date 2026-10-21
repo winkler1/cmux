@@ -274,7 +274,13 @@ async fn a_fork_of_a_claude_chat_with_no_turn_is_refused_and_makes_no_chat() {
     .unwrap();
     let f = c.request(method::SESSION_FORK, json!({"sessionId": id, "cwd": cwd()})).await.unwrap();
     let fid = f["sessionId"].as_str().unwrap().to_owned();
-    assert_eq!(claude_history(&hub, &mut c, &fid).await["prompts"], json!(["first"]));
+    // A whole-chat Claude fork learns its new conversation id from a first
+    // turn acpmux sends at its start (`hub/lifecycle.rs`), so that turn is in
+    // the fork's conversation after the chat's own.
+    assert_eq!(
+        claude_history(&hub, &mut c, &fid).await["prompts"],
+        json!(["first", "This session was just forked. Reply with exactly: ready"])
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
