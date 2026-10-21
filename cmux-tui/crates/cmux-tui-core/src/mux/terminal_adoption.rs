@@ -86,6 +86,7 @@ impl Mux {
             Some(root) => crate::terminal_host_runtime::load_terminal_host_records(root)?,
             None => Vec::new(),
         };
+        crate::startup_trace("adopt: records loaded");
         let mut handled_terminals = HashSet::new();
         // Live hosts this pass hands to their adoption threads.
         let mut deferred: Vec<(
@@ -136,6 +137,7 @@ impl Mux {
         }
         // Every host's row and public id under one registry lock: taken per
         // host, the lock waits on other startup threads cost about 7 ms each.
+        crate::startup_trace("adopt: exit records done");
         let mut prefetched = {
             let registry = self.workspace_registry.lock().unwrap();
             let mut rows = HashMap::new();
@@ -146,6 +148,7 @@ impl Mux {
             }
             rows
         };
+        crate::startup_trace("adopt: prefetched");
         for (record_path, record) in records {
             let terminal_id = record.terminal_id.clone();
             if handled_terminals.contains(&terminal_id) {
@@ -305,7 +308,9 @@ impl Mux {
             deferred.push((record, record_path));
         }
 
+        crate::startup_trace("adopt: loop done");
         self.mark_unadoptable_terminal_hosts(&options, &mut handled_terminals)?;
+        crate::startup_trace("adopt: unadoptable marked");
         // The threads start after this pass: their registry commits would
         // otherwise queue each read above behind them (745 ms for 60 hosts).
         for (record, record_path) in deferred {

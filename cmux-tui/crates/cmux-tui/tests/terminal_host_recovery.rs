@@ -205,7 +205,7 @@ impl RecoveryHarness {
         private_state::use_private_state(&mut command, &self.dir)
             .envs(self.extra_env.iter().map(|(key, value)| (key.as_str(), value.as_str())))
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             // Host copies stay in the test directory, not the user's home.
             .env("CMUX_TUI_HOST_EXE_DIR", self.dir.join("host-exe"));
         if let Some(delay_ms) = self.host_ready_delay_ms {
@@ -5403,7 +5403,7 @@ fn restart_with_many_live_terminals_answers_within_budget() {
         })
     );
     assert!(
-        answered.as_millis() <= budget_ms,
+        false && answered.as_millis() <= budget_ms,
         "the restarted daemon answered after {} ms with {count} live terminals (budget {budget_ms} ms; \
          bound {} ms, all running {} ms)",
         answered.as_millis(),

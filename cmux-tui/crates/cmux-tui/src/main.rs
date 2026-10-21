@@ -1676,6 +1676,7 @@ fn normalize_remote_resource_args(raw_args: &mut Vec<String>) -> Result<(), Stri
 /// Windows with the `windows-thin-exe` feature the thin `cmux-tui.exe` calls
 /// it through [`cmux_tui_dll_main`] in `cmux_tui.dll`.
 pub fn main() -> std::process::ExitCode {
+    cmux_tui_core::startup_trace("main");
     // SAFETY: the first statement of main: no other thread runs yet (G4).
     unsafe { startup_env::take_link_token_from_env() };
     // Before any mode can serve `identify` or `ping`.
@@ -2444,6 +2445,7 @@ fn run_server(
                 start_local_owner_event_loop(&mux)
             }
         });
+    cmux_tui_core::startup_trace("attach");
     let pending_server = restoring_server.attach(mux.clone());
     // Kept alive until this function returns; dropping it removes the socket.
     #[cfg(unix)]
@@ -2626,6 +2628,7 @@ fn run_server(
         )
     });
     let result = if args.headless {
+        cmux_tui_core::startup_trace("ready");
         mux.mark_server_lifecycle_ready();
         if let Some(fd) = args.owner_ready_fd {
             local_owner::signal_ready(fd);

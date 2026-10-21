@@ -212,3 +212,10 @@ pub enum SplitDir {
     /// Split into top/bottom rows.
     Down,
 }
+
+/// DIAG (not for merge): startup step timings on stderr.
+pub fn startup_trace(label: &str) {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    eprintln!("STARTUP-TRACE {:>7.1} ms {label}", start.elapsed().as_secs_f64() * 1000.0);
+}

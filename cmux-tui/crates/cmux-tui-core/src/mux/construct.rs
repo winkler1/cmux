@@ -144,6 +144,7 @@ impl Mux {
         provider_workspace: ProviderWorkspaceState,
         #[cfg_attr(not(test), allow(unused_variables))] test_surface_runtime: bool,
     ) -> anyhow::Result<Arc<Self>> {
+        crate::startup_trace("from_workspace_registry");
         let snapshot = registry.snapshot()?;
         let topology = registry.resource_topology_snapshot()?;
         let session_shutdown = crate::session_shutdown::SessionShutdownClock::open(
@@ -413,11 +414,11 @@ impl Mux {
             mux.record_journal_plugin_exit(plugin_id, generation);
         })));
         crate::journal_ingress::start(&mux, journal_ingress_receiver)?;
-        mux.output_store.start(&mux)?;
+        mux.output_store.start(&mux)?; crate::startup_trace("after mux.output_store.start(&mux)?;");
         mux.materialize_interrupted_resource_workspaces()?;
-        mux.materialize_restored_browsers(&contents)?;
+        mux.materialize_restored_browsers(&contents)?; crate::startup_trace("after mux.materialize_restored_browsers(&conte");
         #[cfg(any(unix, windows))]
-        mux.adopt_terminal_hosts()?;
+        mux.adopt_terminal_hosts()?; crate::startup_trace("after mux.adopt_terminal_hosts()?;");
         {
             let mut state = mux.state.lock().unwrap();
             state.rebuild_resource_indexes();
@@ -432,7 +433,7 @@ impl Mux {
         // the roster while dropping the projection side effect. Reconcile
         // after restored surfaces exist, and repeat at the end of asynchronous
         // terminal adoption for hosts that were not available yet.
-        mux.reconcile_agent_roster_projections();
+        mux.reconcile_agent_roster_projections(); crate::startup_trace("after mux.reconcile_agent_roster_projections()");
         if let Some(diagnostic) = agent_roster_diagnostic {
             mux.report_internal_diagnostic(diagnostic);
         }
@@ -444,15 +445,15 @@ impl Mux {
             }
             std::thread::sleep(Duration::from_millis(25));
         }
-        mux.close_ephemeral_workspaces()?;
+        mux.close_ephemeral_workspaces()?; crate::startup_trace("after mux.close_ephemeral_workspaces()?;");
         // cx-6so.49: host losses whose respawn an earlier owner never ran
         // (it shut down first, or a session shutdown ended the shell).
         #[cfg(any(unix, windows))]
-        mux.respawn_lost_terminals_at_start();
+        mux.respawn_lost_terminals_at_start(); crate::startup_trace("after mux.respawn_lost_terminals_at_start();");
         mux.retry_pending_agent_hooks()?;
         crate::journal_hooks::start(&mux)?;
         mux.start_journal_maintenance()?;
-        crate::state::project_watch::start(&mux);
+        crate::state::project_watch::start(&mux); crate::startup_trace("after crate::state::project_watch::start(&mux)");
         Ok(mux)
     }
 
