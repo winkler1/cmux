@@ -2434,7 +2434,8 @@ class TerminalController {
             socket: socket,
             initialLimits: initialReadLimits,
             authorizationRevocationSignal: authorizationRevocationSignal,
-            codeRouterHandshakeMaximumBytes: 4_096
+            codeRouterHandshakeMaximumBytes:
+                CodeRouterHandoffProtocol.maximumRawFrameBytes
         )
         let writer = ControlClientAsyncWriter(socket: socket)
 
@@ -2501,6 +2502,9 @@ class TerminalController {
                 Self.isCodeRouterHandoffCommand(receivedCommand)
                     || Self.isCodeRouterHandoffBeginCommand(receivedCommand)
                     || Self.isCodeRouterHandoffArmCommand(receivedCommand)
+            let isOversizedCodeRouterHandshake =
+                isCodeRouterHandshakeRoute
+                    && !CodeRouterHandoffProtocol.commandLineFitsRawFrameLimit(line)
             guard !isCodeRouterHandshakeRoute || line == receivedCommand else {
                 _ = await writer.writeAll(Data((Self.socketClientAccessDeniedResponse + "\n").utf8))
                 return
@@ -2549,6 +2553,7 @@ class TerminalController {
                 _ = await writer.writeAll(
                     Data((response + "\n").utf8)
                 )
+                if isOversizedCodeRouterHandshake { continue }
                 return
             }
             // Recheck after admission so a policy refresh cannot cross into execution.

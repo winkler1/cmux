@@ -34,6 +34,17 @@ struct CodeRouterHandoffProtocolTests {
         #expect(protocolCodec.socketPathIsValid("/tmp/cmux\u{E0101}.sock"))
     }
 
+    @Test("counts the final newline within the raw frame limit")
+    func commandLineRawFrameLimit() {
+        let maximumCommandBytes = CodeRouterHandoffProtocol.maximumRawFrameBytes - 1
+        #expect(CodeRouterHandoffProtocol.commandLineFitsRawFrameLimit(
+            String(repeating: "x", count: maximumCommandBytes)
+        ))
+        #expect(!CodeRouterHandoffProtocol.commandLineFitsRawFrameLimit(
+            String(repeating: "x", count: maximumCommandBytes + 1)
+        ))
+    }
+
     @Test("builds the exact proof request")
     func proofRequest() throws {
         let context = try #require(makeContext())

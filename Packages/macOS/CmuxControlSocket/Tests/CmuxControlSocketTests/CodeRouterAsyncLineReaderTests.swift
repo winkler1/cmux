@@ -57,16 +57,35 @@ struct CodeRouterAsyncLineReaderTests {
 
     @Test(arguments: [
         #"{"method":"coderouter.handoff.arm","padding":""#,
-        #"{"padding":""#,
         #"{"method":"normal","padding":""#,
     ])
-    func oversizedOrLateHandoffFailsClosed(_ prefix: String) async throws {
+    func oversizedAmbiguousTopLevelMethodFailsClosed(_ prefix: String) async throws {
         let pair = try UnixSocketFixture.makeSocketPair()
         defer { close(pair.reader); close(pair.writer) }
         try await withHandshakeReader(pair.reader) { reader in
             let frame = prefix + String(repeating: "x", count: 4100) + #"","method":"coderouter.handoff.complete"}"#
             try write(frame + "\n", to: pair.writer)
             #expect(await reader.nextLine(shouldContinueReading: { true }) == nil)
+        }
+    }
+
+    @Test func oversizedCodeRouterFrameIsReturnedOnlyAfterNewlineAndLeavesReaderHealthy() async throws {
+        let pair = try UnixSocketFixture.makeSocketPair()
+        defer { close(pair.reader); close(pair.writer) }
+        try await withHandshakeReader(pair.reader) { reader in
+            let frame = #"{"params":{"padding":""#
+                + String(repeating: "x", count: 4_100)
+                + #""},"method":"coderouter.handoff.begin"}"#
+            try write(frame, to: pair.writer)
+            let firstLine = Task {
+                await reader.nextLine(shouldContinueReading: { true })
+            }
+            // The receiver must wait for the complete frame before it decides
+            // whether to admit or reject the CodeRouter method.
+            try write("\n", to: pair.writer)
+            #expect(await firstLine.value == frame)
+            try write("system.ping\n", to: pair.writer)
+            #expect(await reader.nextLine(shouldContinueReading: { true }) == "system.ping")
         }
     }
 

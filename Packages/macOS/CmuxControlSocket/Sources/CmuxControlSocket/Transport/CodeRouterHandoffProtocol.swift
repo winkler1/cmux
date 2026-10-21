@@ -12,6 +12,11 @@ public struct CodeRouterHandoffProtocol {
     /// The maximum byte count for one request or response, including newline.
     public static let maximumRawFrameBytes = 4_096
 
+    /// Whether a line without its trailing newline fits one raw frame.
+    public static func commandLineFitsRawFrameLimit(_ line: String) -> Bool {
+        line.utf8.count < maximumRawFrameBytes
+    }
+
     /// A successful arm result that the cmux CLI passes to CodeRouter.
     public struct Arm: Equatable, Sendable {
         /// The absolute path of the cmux Unix-domain socket.

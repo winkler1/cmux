@@ -250,6 +250,96 @@ struct ControlClientAsyncTransportTests {
         #expect(received == line)
     }
 
+    @Test(arguments: [true, false])
+    func asyncReaderFramesLargeWorkspaceRequestsRegardlessOfKeyOrder(
+        methodFirst: Bool
+    ) async throws {
+        let pair = try UnixSocketFixture.makeSocketPair()
+        defer {
+            close(pair.reader)
+            close(pair.writer)
+        }
+
+        let padding = String(repeating: "x", count: 6_000)
+        let params = #"{"padding":"\#(padding)","label":"雪 and \"quoted\" value"}"#
+        let line = methodFirst
+            ? #"{"method":"workspace.current","params":\#(params)}"#
+            : #"{"params":\#(params),"method":"workspace.current"}"#
+        let reader = ControlClientAsyncLineReader(
+            socket: pair.reader,
+            codeRouterHandshakeMaximumBytes: 4_096
+        )
+        let receivedLine = Task {
+            await reader.nextLine(shouldContinueReading: { true })
+        }
+
+        let bytes = Array(line.utf8)
+        let fragmentSizes = [1, 7, 31, 2, 257, 64]
+        var offset = 0
+        var fragmentIndex = 0
+        while offset < bytes.count {
+            let end = min(bytes.count, offset + fragmentSizes[fragmentIndex % fragmentSizes.count])
+            #expect(writeFully(Array(bytes[offset..<end]), to: pair.writer))
+            offset = end
+            fragmentIndex += 1
+            let deadline = Date().addingTimeInterval(5)
+            while Date() < deadline {
+                let buffered = bufferingState(reader)
+                if buffered.queued + buffered.pending >= offset { break }
+                try await Task.sleep(nanoseconds: 1_000_000)
+            }
+            let buffered = bufferingState(reader)
+            #expect(buffered.queued + buffered.pending == offset)
+        }
+        // Keep the frame incomplete until its delimiter arrives in a separate write.
+        #expect(writeFully([0x0A], to: pair.writer))
+
+        let received = await receivedLine.value
+        await reader.cancelAndWait()
+        #expect(received == line)
+        let decoded = try #require(
+            JSONSerialization.jsonObject(with: Data(try #require(received).utf8)) as? [String: Any]
+        )
+        #expect(decoded["method"] as? String == "workspace.current")
+        let decodedParams = try #require(decoded["params"] as? [String: Any])
+        #expect(decodedParams["padding"] as? String == padding)
+        #expect(decodedParams["label"] as? String == #"雪 and "quoted" value"#)
+    }
+
+    @Test func malformedFramedRequestReportsParseErrorAndKeepsTheConnectionUsable() async throws {
+        let pair = try UnixSocketFixture.makeSocketPair()
+        defer {
+            close(pair.reader)
+            close(pair.writer)
+        }
+
+        let malformed = #"{"method":"workspace.current""#
+        let valid = #"{"method":"workspace.current"}"#
+        #expect(writeFully(Array((malformed + "\n" + valid + "\n").utf8), to: pair.writer))
+        let reader = ControlClientAsyncLineReader(socket: pair.reader)
+        let parser = ControlRequestParser()
+        let firstLine = await reader.nextLine(shouldContinueReading: { true })
+        guard let first = firstLine else {
+            await reader.cancelAndWait()
+            Issue.record("Malformed JSON frame was dropped")
+            return
+        }
+        guard case .failure(let parseError) = parser.request(fromLine: first) else {
+            await reader.cancelAndWait()
+            Issue.record("Malformed JSON frame was accepted")
+            return
+        }
+        let response = ControlResponseEncoder().response(for: parseError)
+        let nextLine = await reader.nextLine(shouldContinueReading: { true })
+        await reader.cancelAndWait()
+        let responseObject = try #require(
+            JSONSerialization.jsonObject(with: Data(response.utf8)) as? [String: Any]
+        )
+        let error = try #require(responseObject["error"] as? [String: Any])
+        #expect(error["code"] as? String == "parse_error")
+        #expect(nextLine == valid)
+    }
+
     @Test func asyncWriterSuspendsOnlyOnWouldBlockAndPreservesBytes() async throws {
         let pair = try UnixSocketFixture.makeSocketPair()
         defer {

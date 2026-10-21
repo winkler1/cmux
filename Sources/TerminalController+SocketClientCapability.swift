@@ -115,7 +115,7 @@ extension TerminalController {
             // automation, and allowAll do not mint this bearer authority.
             guard let pendingCodeRouterHandoffChallenge,
                   peerHasSameUID,
-                  command.utf8.count <= 4_096,
+                  CodeRouterHandoffProtocol.commandLineFitsRawFrameLimit(command),
                   SocketClientCapabilityCommand(command) == nil,
                   Self.codeRouterHandoffCompleteChallenge(command)
                     == pendingCodeRouterHandoffChallenge.challenge,
@@ -154,7 +154,7 @@ extension TerminalController {
         if Self.isCodeRouterHandoffBeginCommand(command) {
             guard pendingCodeRouterHandoffChallenge == nil,
                   peerHasSameUID,
-                  command.utf8.count <= 4_096,
+                  CodeRouterHandoffProtocol.commandLineFitsRawFrameLimit(command),
                   SocketClientCapabilityCommand(command) == nil,
                   Self.isValidCodeRouterProtocolRequest(
                     command,
@@ -196,7 +196,7 @@ extension TerminalController {
             let cmuxEffectiveUserID = geteuid()
             guard cmuxRealUserID == cmuxEffectiveUserID,
                   peerHasSameUID,
-                  command.utf8.count <= 4_096,
+                  CodeRouterHandoffProtocol.commandLineFitsRawFrameLimit(command),
                   SocketClientCapabilityCommand(command) == nil,
                   let peerProcessID,
                   let peerAuditToken,
