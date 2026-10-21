@@ -108,6 +108,7 @@ pub(super) const GUIDES: &[Guide] = &[
             "mcp",
             "computer",
             "grant",
+            "cloud",
         ],
         text: "`cmux setup list` names every setup task (folder trust, harness install and sign-in, \
         ssh machines, peer updates, accounts, Cloud machines, Tailscale, MCP wiring, Computer \
@@ -127,9 +128,13 @@ pub(super) const GUIDES: &[Guide] = &[
         person turns on `mcp.enabled` (\"mcp\": {\"enabled\": true}) in the settings file, \
         it writes nothing and names that switch. `cmux setup computer-use` turns Computer Use \
         on once the person allows it on the sheet cmux shows, and names each missing macOS \
-        grant with the command that opens its System Settings pane. `cmux setup status` lists \
-        every peer with connected and outdated, every harness, the MCP wiring and Computer \
-        Use. Every `cmux setup` command prints one JSON object: state is ok, changed, planned, \
+        grant with the command that opens its System Settings pane. `cmux setup \
+        cloud-machine` is ok when there is a Cloud machine; otherwise, once the person is \
+        signed in, it creates one after the person allows it on the card cmux shows (it costs \
+        money while it runs), remembers it so a rerun creates no second one, and names \
+        `cmux cloud kill-machine --target machine:ID --confirm` as its undo. `cmux setup \
+        status` lists every peer with connected and outdated, every harness, the MCP wiring, \
+        Computer Use and the Cloud machine. Every `cmux setup` command prints one JSON object: state is ok, changed, planned, \
         needs_user or failed.",
     },
 ];

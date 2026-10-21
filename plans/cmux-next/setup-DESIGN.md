@@ -14,7 +14,7 @@ for what a person must do: an OAuth sign-in, a secret, a macOS switch.
 | Folder trust | GUI (TrustAsk line, sub-session card) | none: raw `acp.trust.set` over the acpmux socket | - | - |
 | Add an ssh machine | GUI (Connect to Machine...) | `cmux acp host setup SSH --json`; `cmux remote connect` | yes (acp) | yes |
 | acpmux peers, host updates | none in the app | `cmux acp host ls/update --json` | yes | yes |
-| Cloud machine | GUI (New Cloud Machine sheet) | `cmux cloud new-machine` opens the sheet; `cmux-vm create` (operator) | sheet no; cmux-vm yes | cmux-vm yes (idempotency keys) |
+| Cloud machine | GUI (New Cloud Machine sheet) | `cmux setup cloud-machine`; from an agent the person allows it on a card in cmux | yes | yes (setup keeps its machine) |
 | Tailscale, mesh | CLI only | `cmux host enable/status --json`; needs Tailscale signed in | yes | yes |
 | MCP servers | docs only; chats cmux starts get them (acpmux `agent_tools`) | `cmux setup mcp [claude\|codex ...]`; `cmux agents doctor --json` checks cmux-cua | yes | yes |
 | Computer Use | GUI (Computer Use Setup) | `cmux setup computer-use`; the person allows it on the app's sheet, and grants are switches in System Settings | yes | yes |
@@ -211,3 +211,29 @@ The Chief loads the `cmux-setup` skill (shipped in optchat-chief's
    and left. Capture consent is not reported by the app yet. Off macOS,
    with no app socket named, it is `not_applicable`. `cmux setup status`
    adds a `computer_use` check.
+6. `cloud-machine`: makes sure the person has a cmux Cloud machine for
+   agents. All of it goes through the app socket: `auth.status` (signed in,
+   `cloud_unavailable`), `cloud.machines` (`machines` and the `creations`
+   in flight) and `action.run newCloudMachine`. Signed out is `needs_user`
+   (`kind` `sign_in`, `cmux cloud sign-in`). A machine setup made is kept
+   in `<state root>/setup/cloud-machine.json` (beside the daemon's
+   `sessions`) and read back in `cloud.machines`: there, it is `ok`
+   (`failed`, which a paused machine also reads today, is `needs_user`
+   with resume and kill named); gone or destroyed, setup makes a new one.
+   Any other machine cmux shows is `ok` and left alone. Otherwise setup
+   runs `newCloudMachine`, which from an agent always asks the person on a
+   card in cmux; the app answers within 30 s, the person's answer
+   included. Made is `changed` with `undo` `cmux cloud kill-machine
+   --target machine:ID --confirm`, and `cost` says what it costs (about
+   $0.26/h for 4 vCPU / 8 GB, no auto-pause); still on its way is
+   `needs_user` (`kind` `wait`): setup keeps the `creation_id` and every
+   rerun waits for it (its row names the machine, or the one new machine
+   is its) and never asks for a second. Declined, or no window to ask in,
+   is `needs_user` (`kind` `declined`); the agent asks before trying
+   again. Plan limits are not read beforehand (the app has no read of them
+   on its socket; `cloud.plan.get` is an app op behind the daemon), so a
+   plan that allows no more machines comes back as the create's refusal
+   (`kind` `app`, the app's text). `--dry-run` asks nothing and is
+   `planned` with the cost. `cmux setup status` adds a `cloud_machine`
+   check. When cloud-team-ready's `cloud list-machines` lands (owner
+   personal|team), setup reads it instead of `cloud.machines`.
