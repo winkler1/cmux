@@ -104,3 +104,14 @@ one.
   Kind `wait` means it is starting: run the task again in a few seconds.
   Kind `declined` means it was not allowed (they said no, or cmux had no
   window to show the sheet in): ask them before running it again.
+- Browser import: `cmux setup browser-import --browser BROWSER` (a name
+  like Chrome or Arc) imports its bookmarks into cmux; `ok` means they are
+  already in, and `undo` removes the new folders. Without `--browser` the
+  result is kind `choose`: ask the user which browser, or run its
+  `command` to show them cmux's list. Cookies (their sign-ins) are theirs:
+  ask the user first, then run it with `--cookies` and a `--reason` they
+  will read (`--domain` keeps it to some sites); cmux shows them a panel
+  to allow it, then macOS asks for the browser's Keychain password. It has
+  no undo and running it again asks them again. Kind `declined` means they
+  said no: do not ask again unless they bring it up. History and
+  passwords only the user imports, from Import from Browser... in cmux.

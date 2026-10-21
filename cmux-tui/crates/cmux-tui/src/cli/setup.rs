@@ -3,9 +3,10 @@
 //!
 //! `list` names every setup task and the command that checks and does it,
 //! whether `setup` itself runs it yet or an older command does. A task that
-//! `setup` runs (`trust`, `machine`, `harness`, `mcp` and `computer-use` today) checks before it
-//! changes anything, changes nothing when the state is already right, prints
-//! what it would do with `--dry-run`, and names the command that undoes it.
+//! `setup` runs (`trust`, `machine`, `harness`, `mcp`, `computer-use` and
+//! `browser-import` today) checks before it changes anything, changes
+//! nothing when the state is already right, prints what it would do with
+//! `--dry-run`, and names the command that undoes it.
 //! Only what a person must do themselves (an OAuth sign-in, a secret,
 //! installing a CLI, a macOS grant, a key on an ssh machine) comes back as
 //! `user_action`. Output is always JSON: these commands are for agents.
@@ -14,13 +15,14 @@ use serde_json::{Value, json};
 
 use super::{GlobalArgs, OutputMode, parse_globals, wire};
 
+mod browser_import;
 mod computer_use;
 mod harness;
 mod machine;
 mod mcp;
 mod trust;
 
-const HELP: &str = "Usage: cmux setup <list|status|trust|machine|harness|mcp|computer-use>\n\nSet up cmux for the person, from an agent. Every command prints one JSON object.\n\n  cmux setup list                 Every setup task and the commands that check and do it\n  cmux setup status               Read-only checks of the tasks setup runs\n  cmux setup trust [FOLDER] [--level trusted|untrusted|unknown] [--dry-run]\n                                  Record the person's trust for a folder (default: this folder, trusted)\n  cmux setup machine SSH_TARGET [--name NAME] [--dry-run]\n                                  Add an ssh machine as an agent peer, or update or repair it (key-only ssh)\n  cmux setup harness [ID ...] [--dry-run]\n                                  Check that each harness is installed, signed in and current (default: every configured or found one)\n  cmux setup mcp [claude|codex ...] [--dry-run]\n                                  Give Claude Code and Codex outside cmux the cmux MCP server (default: each installed one)\n  cmux setup computer-use [--dry-run]\n                                  Turn on cmux Computer Use (the person allows it in cmux) and name the macOS grants it still needs\n\nA task result is {schema_version, task, state, dry_run, ..., undo, user_action}. state is ok (nothing to do), changed, planned (--dry-run), needs_user (user_action says what the person must do) or failed. undo is the command that puts the old state back, or null. Exits 0 unless the task failed (1) or the arguments are wrong (2).\n";
+const HELP: &str = "Usage: cmux setup <list|status|trust|machine|harness|mcp|computer-use|browser-import>\n\nSet up cmux for the person, from an agent. Every command prints one JSON object.\n\n  cmux setup list                 Every setup task and the commands that check and do it\n  cmux setup status               Read-only checks of the tasks setup runs\n  cmux setup trust [FOLDER] [--level trusted|untrusted|unknown] [--dry-run]\n                                  Record the person's trust for a folder (default: this folder, trusted)\n  cmux setup machine SSH_TARGET [--name NAME] [--dry-run]\n                                  Add an ssh machine as an agent peer, or update or repair it (key-only ssh)\n  cmux setup harness [ID ...] [--dry-run]\n                                  Check that each harness is installed, signed in and current (default: every configured or found one)\n  cmux setup mcp [claude|codex ...] [--dry-run]\n                                  Give Claude Code and Codex outside cmux the cmux MCP server (default: each installed one)\n  cmux setup computer-use [--dry-run]\n                                  Turn on cmux Computer Use (the person allows it in cmux) and name the macOS grants it still needs\n  cmux setup browser-import [--browser BROWSER] [--cookies [--domain D] [--reason TEXT]] [--dry-run]\n                                  Import another browser's bookmarks, or with --cookies its sign-ins (the person allows it in cmux)\n\nA task result is {schema_version, task, state, dry_run, ..., undo, user_action}. state is ok (nothing to do), changed, planned (--dry-run), needs_user (user_action says what the person must do) or failed. undo is the command that puts the old state back, or null. Exits 0 unless the task failed (1) or the arguments are wrong (2).\n";
 
 /// The result of a setup task: the JSON the agent reads, and whether it failed.
 pub(super) struct Outcome {
@@ -62,6 +64,7 @@ fn run(global: &GlobalArgs, args: &[String]) -> i32 {
         Some("harness") => harness::run(&args[1..]),
         Some("mcp") => mcp::run(&args[1..]),
         Some("computer-use" | "computer_use") => computer_use::run(global, &args[1..]),
+        Some("browser-import" | "browser_import") => browser_import::run(global, &args[1..]),
         Some(other) => Err(Refusal::Usage(format!(
             "cmux: setup: unknown task {other:?}; `cmux setup list` names every task"
         ))),
@@ -185,14 +188,16 @@ const TASKS: &[Task] = &[
     Task {
         id: "browser_import",
         summary: "Bring bookmarks, cookies, history and passwords from another browser",
-        setup: None,
-        check: &["cmux bookmark list"],
+        setup: Some(
+            "cmux setup browser-import --browser BROWSER [--cookies [--domain D] [--reason TEXT]] [--dry-run]",
+        ),
+        check: &["cmux setup browser-import --browser BROWSER --dry-run", "cmux bookmark list"],
         apply: &[
-            "cmux bookmark import-from-browser --browser BROWSER",
-            "cmux browser import-cookies --from BROWSER:PROFILE --domain DOMAIN --reason REASON",
+            "cmux setup browser-import --browser BROWSER",
+            "cmux setup browser-import --browser BROWSER --cookies --domain DOMAIN --reason REASON",
         ],
         person: Some(
-            "history and password import (Import from Browser...) and the Keychain prompt",
+            "allowing the cookie import on the panel cmux shows and the Keychain prompt; history and password import (Import from Browser...)",
         ),
     },
     Task {
@@ -241,8 +246,9 @@ fn list() -> Value {
 /// The read-only check of every task `setup` runs: this folder's trust,
 /// every acpmux peer with whether it is connected and on this build, every
 /// harness with whether it is installed, signed in and current, whether
-/// Claude Code and Codex outside cmux have the cmux MCP server, and whether
-/// agents can use the Mac (Computer Use and its macOS grants).
+/// Claude Code and Codex outside cmux have the cmux MCP server, whether
+/// agents can use the Mac (Computer Use and its macOS grants), and which
+/// browsers' bookmarks are imported.
 fn status(global: &GlobalArgs) -> Result<Outcome, Refusal> {
     let checks = [
         trust::status()?,
@@ -250,6 +256,7 @@ fn status(global: &GlobalArgs) -> Result<Outcome, Refusal> {
         harness::status(),
         mcp::status(),
         computer_use::status(global),
+        browser_import::status(global),
     ];
     Ok(Outcome { report: json!({"schema_version": 1, "checks": checks}), failed: false })
 }

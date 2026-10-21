@@ -108,6 +108,8 @@ pub(super) const GUIDES: &[Guide] = &[
             "mcp",
             "computer",
             "grant",
+            "bookmarks",
+            "cookies",
         ],
         text: "`cmux setup list` names every setup task (folder trust, harness install and sign-in, \
         ssh machines, peer updates, accounts, Cloud machines, Tailscale, MCP wiring, Computer \
@@ -127,9 +129,13 @@ pub(super) const GUIDES: &[Guide] = &[
         person turns on `mcp.enabled` (\"mcp\": {\"enabled\": true}) in the settings file, \
         it writes nothing and names that switch. `cmux setup computer-use` turns Computer Use \
         on once the person allows it on the sheet cmux shows, and names each missing macOS \
-        grant with the command that opens its System Settings pane. `cmux setup status` lists \
-        every peer with connected and outdated, every harness, the MCP wiring and Computer \
-        Use. Every `cmux setup` command prints one JSON object: state is ok, changed, planned, \
+        grant with the command that opens its System Settings pane. `cmux setup \
+        browser-import --browser BROWSER` imports that browser's bookmarks (ok when they are \
+        in; the undo removes the new folders); with --cookies it imports its sign-ins once the \
+        person allows it on the panel cmux shows, and that has no undo. History and passwords \
+        come in only from Import from Browser... in cmux. `cmux setup status` lists every \
+        peer with connected and outdated, every harness, the MCP wiring, Computer Use and the \
+        imported browsers. Every `cmux setup` command prints one JSON object: state is ok, changed, planned, \
         needs_user or failed.",
     },
 ];
