@@ -556,6 +556,8 @@ export type SessionDetail = {
   unread: boolean;
   updatedAt: number;
   usage?: unknown;
+  /** The family of a conversation another app runs that this chat only shows; null otherwise. */
+  watching?: (string | null);
 } & Record<string, unknown>;
 
 /** One record of a session's log (`server::event_value`). */
