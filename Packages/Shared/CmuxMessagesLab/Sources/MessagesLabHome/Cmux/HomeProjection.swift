@@ -805,6 +805,9 @@ struct ProjectionCore {
         return (conv, HomeMapping.window(items))
     }
 
+    /// Scratch stub (red proof for #23568): the new entry point with no behaviour.
+    mutating func setAvatars(_ new: [String: Participant.Avatar]) -> Action? { nil }
+
     /// The actions from the shown snapshot to this one.
     mutating func step(items: [TranscriptItem], summary new: ConversationSummary?) -> HomeDiff {
         // The shown snapshot again (a streamed token, typing, the activity line): nothing to diff.
