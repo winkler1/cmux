@@ -131,10 +131,11 @@ pub(super) const GUIDES: &[Guide] = &[
         grant with the command that opens its System Settings pane. `cmux setup \
         cloud-machine` is ok when cmux shows a Cloud machine; otherwise, once the person is \
         signed in, it creates one after the person allows it on the card cmux shows (it costs \
-        money every hour it runs). It keeps the request, so a rerun waits for a machine on its \
-        way and never creates a second; kind wait means run it again later, kind declined \
-        means ask first, and its undo is `cmux cloud kill-machine --target machine:ID \
-        --confirm`. `cmux setup status` lists every peer with connected and outdated, every \
+        money every hour it runs). It keeps the request and reads cmux's list before anything \
+        else, so a rerun adopts the machine that appeared, waits for one on its way, and never \
+        creates a second; kind wait means run it again later, kind declined means ask first, \
+        and its undo is `cmux cloud kill-machine --target machine:ID --confirm && cmux setup \
+        cloud-machine --forget` (--forget drops setup's record so it may ask again). `cmux setup status` lists every peer with connected and outdated, every \
         harness, the MCP wiring, Computer Use and the Cloud machine. Every `cmux setup` \
         command prints one JSON object: state is ok, changed, planned, needs_user or failed.",
     },

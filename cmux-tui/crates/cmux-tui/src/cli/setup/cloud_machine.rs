@@ -1,5 +1,5 @@
-//! `cmux setup cloud-machine [--dry-run]`: makes sure the person has a cmux
-//! Cloud machine for agents, and creates one with their OK.
+//! `cmux setup cloud-machine [--dry-run] [--forget]`: makes sure the person
+//! has a cmux Cloud machine for agents, and creates one with their OK.
 //!
 //! Everything goes through the app: `auth.status` (signed in, and whether
 //! Cloud can run in this build), `cloud.machines` (the machines it shows and
@@ -11,15 +11,19 @@
 //! runs and does not pause by itself, so the undo kills it.
 //!
 //! Setup keeps what it asked for in its own state file ([`state`]): the
-//! run's idempotency key, written before the create is sent, then the
-//! creation or the machine it became. A rerun reads that back in
-//! `cloud.machines`, sends a create whose answer it never read again with
-//! the same key (the app answers it once), and never starts a second
-//! machine while one is on its way. Any machine cmux already shows is
-//! enough, and setup leaves it alone. A list cmux has not loaded, or could
-//! not, decides nothing. Plan limits are not read beforehand: the app has no
-//! read of them on its socket, so a plan that allows no more machines comes
-//! back as the create's refusal, with the app's text.
+//! run's idempotency key and the machines and creations cmux showed, written
+//! before the create is sent, then the creation or the machine it became.
+//! One run at a time decides, under a lock. A rerun reads `cloud.machines`
+//! first: the one new machine, or a creation that names its machine, is
+//! setup's; a new creation still on its way is waited for; only when nothing
+//! new appeared does it send the create again with the same key (the app's
+//! answer to a key lives in memory, so a restarted cmux would show a second
+//! card and make a second machine). Any machine cmux already shows is
+//! enough, and setup leaves it alone. A list cmux could not read, has not
+//! loaded, or shows empty while setup has a machine or a request on file,
+//! decides nothing. Plan limits are not read beforehand: the app has no read
+//! of them on its socket, so a plan that allows no more machines comes back
+//! as the create's refusal, with the app's text.
 
 mod state;
 
@@ -34,6 +38,9 @@ const TASK: &str = "cloud_machine";
 /// The command that runs (and reruns) this task.
 const RERUN: &str = "cmux setup cloud-machine";
 
+/// The command that drops what setup keeps, so it asks for a new machine.
+const FORGET: &str = "cmux setup cloud-machine --forget";
+
 /// The action that creates a machine; from an agent it asks the person.
 const CREATE: &str = "newCloudMachine";
 
@@ -41,16 +48,13 @@ const CREATE: &str = "newCloudMachine";
 const COST: &str = "A cmux Cloud machine costs money for every hour it runs, at the rate of the \
                     person's plan, and it does not pause by itself";
 
-/// The undo of a create before its machine has an id.
-const PLANNED_UNDO: &str = "cmux cloud kill-machine --target machine:MACHINE_ID --confirm";
-
 /// The app's reason when the person declined the card or dismissed it
 /// (`CloudStrings.createDeclined`); any other refusal is the app's to say.
 const DECLINED_REASON: &str =
     "No Cloud machine was created: the person declined or dismissed it in cmux.";
 
 pub(super) fn run(global: &GlobalArgs, args: &[String]) -> Result<Outcome, Refusal> {
-    let dry_run = parse(args)?;
+    let (dry_run, forget_only) = parse(args)?;
     let mut report = json!({
         "schema_version": 1,
         "task": TASK,
@@ -61,11 +65,19 @@ pub(super) fn run(global: &GlobalArgs, args: &[String]) -> Result<Outcome, Refus
         "user_action": Value::Null,
         "machine": Value::Null,
     });
+    if forget_only {
+        return forget(report, dry_run);
+    }
     if !applies(global) {
         report["state"] = json!("not_applicable");
         return Ok(Outcome { report, failed: false });
     }
-    let listing = match signed_in(global).and_then(|()| read(global, "cloud.machines")) {
+    if let Err(action) = signed_in(global) {
+        return needs_user(report, action);
+    }
+    // One run at a time reads the list, decides and creates.
+    let _lock = Saved::lock()?;
+    let listing = match read(global, "cloud.machines") {
         Ok(listing) => listing,
         Err(action) => return needs_user(report, action),
     };
@@ -86,7 +98,7 @@ pub(super) fn run(global: &GlobalArgs, args: &[String]) -> Result<Outcome, Refus
             }
             needs_user(report, action)
         }
-        Step::Machine { row, made } => {
+        Step::Machine { row, made, inferred } => {
             let id = row["id"].as_str().unwrap_or_default().to_owned();
             report["after"] = row.clone();
             report["machine"] = row.clone();
@@ -100,25 +112,37 @@ pub(super) fn run(global: &GlobalArgs, args: &[String]) -> Result<Outcome, Refus
                 (None, false) => "ok",
             });
             report["user_action"] = action.unwrap_or(Value::Null);
+            if inferred {
+                report["inferred"] = json!(true);
+            }
             if made && !dry_run {
-                report["undo"] = json!(kill(&id));
+                report["undo"] = json!(undo(&id));
+                if inferred {
+                    report["undo_note"] = json!(format!(
+                        "cmux never named {id} as the machine setup asked for: it is the one \
+                         machine that appeared since. Check it is not one the person made before \
+                         running the undo"
+                    ));
+                }
                 keep(&mut report, &Saved { machine_id: Some(id), ..Saved::default() });
             }
             Ok(Outcome { report, failed: false })
         }
         Step::Ask { key, .. } if dry_run => {
             report["state"] = json!("planned");
-            report["undo"] = json!(PLANNED_UNDO);
+            report["undo"] = json!(undo("MACHINE_ID"));
             report["cost"] = json!(COST);
             if key.is_some() {
                 report["note"] = json!(
-                    "A create setup sent earlier has no answer yet; the run asks cmux about \
-                     that one again and shows no second card"
+                    "A create setup sent earlier has no answer and cmux shows nothing new; the \
+                     run sends that same create again"
                 );
             }
             Ok(Outcome { report, failed: false })
         }
-        Step::Ask { key, known } => create(global, report, key, known),
+        Step::Ask { key, known, known_creations } => {
+            create(global, report, key, known, known_creations)
+        }
     }
 }
 
@@ -156,6 +180,26 @@ pub(super) fn status(global: &GlobalArgs) -> Value {
     }
 }
 
+/// `--forget`: drops what setup keeps (after its machine was killed, or
+/// once the person says no machine is on its way), so the next run asks
+/// for a new machine. It changes nothing in cmux.
+fn forget(mut report: Value, dry_run: bool) -> Result<Outcome, Refusal> {
+    let _lock = Saved::lock()?;
+    let saved = Saved::load();
+    if saved.is_empty() {
+        report["state"] = json!("ok");
+        return Ok(Outcome { report, failed: false });
+    }
+    report["before"] = saved.to_json();
+    if dry_run {
+        report["state"] = json!("planned");
+    } else {
+        Saved::default().save()?;
+        report["state"] = json!("changed");
+    }
+    Ok(Outcome { report, failed: false })
+}
+
 /// What the run does next, read from cmux's list and setup's state alone.
 struct Look {
     step: Step,
@@ -167,102 +211,142 @@ enum Step {
     /// Nothing to decide yet (the list is not loaded, a creation is on its
     /// way); nothing is changed or asked.
     Wait(Value),
-    /// Setup's creation ended without a machine: what to tell the person.
+    /// Setup's request ended without a machine: what to tell the person.
     Ended(Value),
-    /// A machine cmux shows; `made` when it is the one setup's creation
-    /// just became.
-    Machine { row: Value, made: bool },
-    /// No machine: ask for one, with the key of a create whose answer setup
-    /// never read (sent again, so the app answers it once), or a new one.
-    Ask { key: Option<String>, known: Vec<String> },
+    /// A machine cmux shows; `made` when it is the one setup asked for and
+    /// has not claimed yet, `inferred` when cmux never named it as that
+    /// one (it is the one machine that appeared since).
+    Machine { row: Value, made: bool, inferred: bool },
+    /// No machine and nothing new: ask for one, with the key of a create
+    /// whose answer setup never read (sent again), or a new one.
+    Ask { key: Option<String>, known: Vec<String>, known_creations: Vec<String> },
+}
+
+impl Step {
+    fn wait(text: &str) -> Self {
+        Self::Wait(action("wait", text, Some(RERUN)))
+    }
 }
 
 fn look(listing: &Value, saved: &Saved) -> Look {
-    let wait = |step| Look { step, gone: None };
+    let only = |step| Look { step, gone: None };
     if let Some(error) = listing["last_error"].as_str() {
-        return wait(Step::Wait(action(
+        return only(Step::wait(&format!(
+            "cmux could not read the Cloud machines ({error}); run `cmux setup cloud-machine` \
+             again once cmux shows them"
+        )));
+    }
+    if listing["loaded"] == false {
+        return only(Step::wait(
+            "cmux has not loaded the Cloud machines yet; run `cmux setup cloud-machine` again \
+             in a few seconds",
+        ));
+    }
+    if let Some(creation) = &saved.creation_id
+        && creations(listing).any(|row| row["id"] == creation.as_str())
+    {
+        return only(settle(creation, &saved.known, listing));
+    }
+    if !saved.is_empty() && live_machines(listing).next().is_none() && listing["loaded"] != true {
+        // Before its first refresh cmux lists nothing: an empty list says
+        // nothing about what setup made or asked for.
+        return only(Step::Wait(action(
             "wait",
             &format!(
-                "cmux could not read the Cloud machines ({error}); run `cmux setup cloud-machine` \
-                 again once cmux shows them"
+                "cmux shows no Cloud machine, maybe because it has not loaded them yet; run \
+                 `cmux setup cloud-machine` again in a few seconds. If cmux still shows none and \
+                 none is on its way, ask the person, then `{FORGET}` lets setup ask for a new one"
             ),
             Some(RERUN),
         )));
     }
-    if listing["loaded"] == false {
-        return wait(Step::Wait(action(
-            "wait",
-            "cmux has not loaded the Cloud machines yet; run `cmux setup cloud-machine` again \
-             in a few seconds",
-            Some(RERUN),
-        )));
-    }
     if let Some(creation) = &saved.creation_id {
-        match settle(creation, &saved.known, listing) {
-            Settled::Machine(id) => {
-                let row = machine(listing, &id).map(view).unwrap_or_else(|| {
-                    json!({"id": id, "title": null, "status": "provisioning",
-                           "target": format!("machine:{id}")})
-                });
-                return wait(Step::Machine { row, made: true });
-            }
-            Settled::Pending => return wait(Step::Wait(wait_step())),
-            Settled::Ended(action) => return wait(Step::Ended(action)),
-        }
+        return only(settle(creation, &saved.known, listing));
     }
     let mut gone = None;
     if let Some(id) = &saved.machine_id {
         if let Some(row) = machine(listing, id) {
-            return Look { step: Step::Machine { row: view(row), made: false }, gone: None };
+            return only(Step::Machine { row: view(row), made: false, inferred: false });
         }
         gone = Some(id.clone());
     }
-    let step = if let Some(key) = &saved.key {
-        Step::Ask { key: Some(key.clone()), known: saved.known.clone() }
+    let step = if saved.key.is_some() {
+        follow(listing, saved)
     } else if let Some(row) = live_machines(listing).next() {
         // The person's own machine: there is one, and setup leaves it.
-        Step::Machine { row: view(row), made: false }
+        Step::Machine { row: view(row), made: false, inferred: false }
     } else if creations(listing).any(|row| row["stage"] != "failed") {
         // A machine on its way that setup did not ask for (a click in cmux).
-        Step::Wait(action(
-            "wait",
+        Step::wait(
             "A Cloud machine is on its way in cmux; run `cmux setup cloud-machine` again once \
              it is up, so setup makes no second one",
-            Some(RERUN),
-        ))
+        )
     } else {
-        Step::Ask { key: None, known: machine_ids(listing) }
+        Step::Ask { key: None, known: machine_ids(listing), known_creations: creation_ids(listing) }
     };
     Look { step, gone }
 }
 
+/// A create setup sent and never read the answer to: what cmux shows that
+/// was not there when setup asked decides, and only when nothing new
+/// appeared is it sent again with its key.
+fn follow(listing: &Value, saved: &Saved) -> Step {
+    let new_creations = creations(listing)
+        .filter(|row| {
+            row["id"]
+                .as_str()
+                .is_some_and(|id| !saved.known_creations.iter().any(|known| known == id))
+        })
+        .collect::<Vec<_>>();
+    if let Some(id) = new_creations.iter().find_map(|row| row["machine_id"].as_str()) {
+        return Step::Machine { row: machine_row(listing, id), made: true, inferred: false };
+    }
+    if new_creations.iter().any(|row| row["stage"] != "failed") {
+        return Step::Wait(wait_step());
+    }
+    match new_machines(listing, &saved.known).as_slice() {
+        [only] => Step::Machine { row: machine_row(listing, only), made: true, inferred: true },
+        [] => match new_creations.first() {
+            Some(row) => Step::Ended(failed_creation(row)),
+            None => Step::Ask {
+                key: saved.key.clone(),
+                known: saved.known.clone(),
+                known_creations: saved.known_creations.clone(),
+            },
+        },
+        many => Step::Ended(many_machines(many)),
+    }
+}
+
 /// Sends the create, with `key` when setup sent it before and never read
 /// its answer. The key is kept before the create goes out, and kept after
-/// it when the answer may still come.
+/// it unless the app says nothing ran or the person declined.
 fn create(
     global: &GlobalArgs,
     mut report: Value,
     key: Option<String>,
     known: Vec<String>,
+    known_creations: Vec<String>,
 ) -> Result<Outcome, Refusal> {
     let key = match key {
         Some(key) => {
-            eprintln!(
-                "cmux: setup cloud-machine: asking cmux again about the machine it asked for"
-            );
+            eprintln!("cmux: setup cloud-machine: sending the create it never had an answer to");
             key
         }
         None => {
             let key = super::super::command::random_prefixed("mutation")
                 .map_err(|error| Refusal::Failed(format!("cmux: setup cloud-machine: {error}")))?;
-            Saved { key: Some(key.clone()), known: known.clone(), ..Saved::default() }.save()?;
-            eprintln!(
-                "cmux: setup cloud-machine: waiting for the person to allow a new Cloud machine \
-                 in cmux"
-            );
+            let saved = Saved {
+                key: Some(key.clone()),
+                known: known.clone(),
+                known_creations: known_creations.clone(),
+                ..Saved::default()
+            };
+            saved.save()?;
             key
         }
     };
+    eprintln!("cmux: setup cloud-machine: waiting for the person to allow a new Cloud machine");
     report["cost"] = json!(COST);
     let params = Value::Object(super::super::app::action_run_params(
         CREATE,
@@ -280,15 +364,29 @@ fn create(
         Ok(run) => run["result"].clone(),
         Err(error) => {
             let code = error["code"].as_str().unwrap_or_default();
-            if matches!(code, "app.transport" | "timeout") {
-                // The create may have gone through: keep its key for the rerun.
-                return needs_user(report, wait_step());
+            let declined = code == "unavailable" && error["data"]["reason"] == DECLINED_REASON;
+            // Nothing ran: the app says so, or the request never left.
+            let not_run = code == "busy"
+                || error["data"]["not_run"] == true
+                || error["details"]["state"] == "not_run";
+            if declined || not_run {
+                Saved::default().save()?;
             }
-            Saved::default().save()?;
-            let action = if code == "unavailable" && error["data"]["reason"] == DECLINED_REASON {
-                declined()
-            } else {
+            let action = if declined {
+                declined_step()
+            } else if matches!(code, "app.transport" | "timeout") {
+                // The create may have gone through: the rerun reads the list.
+                wait_step()
+            } else if not_run {
                 app_problem(&error)
+            } else {
+                let mut action = app_problem(&error);
+                action["text"] = json!(format!(
+                    "{}. Setup keeps the request, so a rerun makes no second machine; once the \
+                     cause is fixed (a plan with room, say), `{FORGET}` lets setup ask again",
+                    action["text"].as_str().unwrap_or_default()
+                ));
+                action
             };
             return needs_user(report, action);
         }
@@ -297,7 +395,7 @@ fn create(
         let row = view(&result);
         report["after"] = row.clone();
         report["machine"] = row;
-        report["undo"] = json!(kill(id));
+        report["undo"] = json!(undo(id));
         report["state"] = json!("changed");
         keep(&mut report, &Saved { machine_id: Some(id.to_owned()), ..Saved::default() });
         return Ok(Outcome { report, failed: false });
@@ -310,6 +408,7 @@ fn create(
             creation_id: Some(creation.to_owned()),
             key: Some(key),
             known,
+            known_creations,
             ..Saved::default()
         };
         keep(&mut report, &saved);
@@ -334,11 +433,13 @@ fn needs_user(mut report: Value, action: Value) -> Result<Outcome, Refusal> {
     Ok(Outcome { report, failed: false })
 }
 
-fn parse(args: &[String]) -> Result<bool, Refusal> {
-    let mut dry_run = false;
+/// `(--dry-run, --forget)`.
+fn parse(args: &[String]) -> Result<(bool, bool), Refusal> {
+    let (mut dry_run, mut forget) = (false, false);
     for arg in args {
         match arg.as_str() {
             "--dry-run" => dry_run = true,
+            "--forget" => forget = true,
             other => {
                 return Err(Refusal::Usage(format!(
                     "cmux: setup cloud-machine: unexpected argument {other:?}"
@@ -346,7 +447,7 @@ fn parse(args: &[String]) -> Result<bool, Refusal> {
             }
         }
     }
-    Ok(dry_run)
+    Ok((dry_run, forget))
 }
 
 /// Whether there is a cmux app to ask: macOS, or an app socket named by
@@ -388,7 +489,7 @@ fn signed_in(global: &GlobalArgs) -> Result<(), Value> {
     ))
 }
 
-fn declined() -> Value {
+fn declined_step() -> Value {
     action(
         "declined",
         "No Cloud machine was made: the person declined, or cmux had no window to ask in; ask \
@@ -397,54 +498,68 @@ fn declined() -> Value {
     )
 }
 
-/// What became of a creation setup started.
-enum Settled {
-    Machine(String),
-    Pending,
-    /// It ended without a machine: what to tell the person.
-    Ended(Value),
-}
-
-/// Finds creation `id` in `listing`. A creation leaves the list when the
-/// person declined it, or once its machine's workspace shows; then the one
-/// machine that was not there before (`known`) is its machine.
-fn settle(id: &str, known: &[String], listing: &Value) -> Settled {
+/// Follows creation `id`, which the app answered for setup's create. Its
+/// row names its machine once there is one; it leaves the list when the
+/// person declined it, or once its machine's workspace shows, and then the
+/// one machine that was not there before (`known`) is its machine.
+fn settle(id: &str, known: &[String], listing: &Value) -> Step {
     if let Some(row) = creations(listing).find(|row| row["id"] == id) {
         if let Some(machine) = row["machine_id"].as_str() {
-            return Settled::Machine(machine.to_owned());
+            return Step::Machine {
+                row: machine_row(listing, machine),
+                made: true,
+                inferred: false,
+            };
         }
         if row["stage"] == "failed" {
-            let detail = row["stage_detail"].as_str().unwrap_or("no reason given");
-            return Settled::Ended(action(
-                "app",
-                &format!("cmux could not make the Cloud machine ({detail}); cmux shows the reason"),
-                None,
-            ));
+            return Step::Ended(failed_creation(row));
         }
-        return Settled::Pending;
+        return Step::Wait(wait_step());
     }
-    let new = machine_ids(listing).into_iter().filter(|id| !known.contains(id)).collect::<Vec<_>>();
-    match new.as_slice() {
-        [only] => Settled::Machine(only.clone()),
-        [] => Settled::Ended(declined()),
-        _ => Settled::Ended(action(
-            "app",
-            &format!(
-                "More than one Cloud machine appeared ({}); setup cannot tell which is its own",
-                new.join(", ")
-            ),
-            None,
-        )),
+    match new_machines(listing, known).as_slice() {
+        [only] => Step::Machine { row: machine_row(listing, only), made: true, inferred: true },
+        [] => Step::Ended(declined_step()),
+        many => Step::Ended(many_machines(many)),
     }
+}
+
+fn failed_creation(row: &Value) -> Value {
+    let detail = row["stage_detail"].as_str().unwrap_or("no reason given");
+    action(
+        "app",
+        &format!("cmux could not make the Cloud machine ({detail}); cmux shows the reason"),
+        None,
+    )
+}
+
+fn many_machines(ids: &[String]) -> Value {
+    action(
+        "app",
+        &format!(
+            "More than one Cloud machine appeared ({}); setup cannot tell which is its own and \
+             leaves them to the person",
+            ids.join(", ")
+        ),
+        None,
+    )
 }
 
 fn creations(listing: &Value) -> impl Iterator<Item = &Value> {
     listing["creations"].as_array().map(Vec::as_slice).unwrap_or_default().iter()
 }
 
+fn creation_ids(listing: &Value) -> Vec<String> {
+    creations(listing).filter_map(|row| row["id"].as_str()).map(str::to_owned).collect()
+}
+
 /// The ids of the machines cmux shows that are not destroyed.
 fn machine_ids(listing: &Value) -> Vec<String> {
     live_machines(listing).filter_map(|row| row["id"].as_str()).map(str::to_owned).collect()
+}
+
+/// The machines cmux shows that are not in `known`.
+fn new_machines(listing: &Value, known: &[String]) -> Vec<String> {
+    machine_ids(listing).into_iter().filter(|id| !known.contains(id)).collect()
 }
 
 fn live_machines(listing: &Value) -> impl Iterator<Item = &Value> {
@@ -459,6 +574,13 @@ fn live_machines(listing: &Value) -> impl Iterator<Item = &Value> {
 /// Machine `id` in `listing`, unless it is gone or destroyed.
 fn machine<'a>(listing: &'a Value, id: &str) -> Option<&'a Value> {
     live_machines(listing).find(|row| row["id"] == id)
+}
+
+/// Machine `id` as setup reports it, also before cmux lists it.
+fn machine_row(listing: &Value, id: &str) -> Value {
+    machine(listing, id).map(view).unwrap_or_else(|| {
+        json!({"id": id, "title": null, "status": "provisioning", "target": format!("machine:{id}")})
+    })
 }
 
 /// A machine as setup reports it, from a `cloud.machines` row (`id`) or a
@@ -478,7 +600,7 @@ fn machine_step(row: &Value) -> Option<Value> {
             &format!(
                 "The Cloud machine {id} failed; cmux shows why. `{}` removes it, and `cmux setup \
                  cloud-machine` then makes a new one",
-                kill(id)
+                undo(id)
             ),
             None,
         )
@@ -495,8 +617,9 @@ fn paused_note(row: &Value) -> Option<String> {
     })
 }
 
-fn kill(id: &str) -> String {
-    format!("cmux cloud kill-machine --target machine:{id} --confirm")
+/// Kills machine `id`, then drops setup's record of it.
+fn undo(id: &str) -> String {
+    format!("cmux cloud kill-machine --target machine:{id} --confirm && {FORGET}")
 }
 
 /// The creation is on its way, or the person has not answered yet.
@@ -526,6 +649,7 @@ fn app_problem(error: &Value) -> Value {
         "app.transport" | "timeout" => {
             "cmux did not answer; run `cmux setup cloud-machine` again".to_owned()
         }
+        "busy" => "cmux was busy and made nothing; run `cmux setup cloud-machine` again".to_owned(),
         _ => format!("cmux refused ({code}): {message}"),
     };
     action("app", &text, None)

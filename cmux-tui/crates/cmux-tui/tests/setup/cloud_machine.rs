@@ -13,6 +13,8 @@ use super::{World, serve_app, shell_words};
 /// The app's reason when the person declines the card.
 const DECLINED: &str = "No Cloud machine was created: the person declined or dismissed it in cmux.";
 
+const FORGET: &str = "cmux setup cloud-machine --forget";
+
 /// How the fake app's person answers the New Cloud Machine card.
 #[derive(Clone, Copy, PartialEq)]
 enum Card {
@@ -25,23 +27,32 @@ enum Card {
     /// Allowed, and the connection drops before the answer: the machine is
     /// made and setup never reads it.
     Drop,
+    /// The connection drops before the app took the request: nothing made.
+    Lost,
+    /// Allowed, and the app answers no `result` (an app before #23155):
+    /// the creation is on its way.
+    Null,
 }
 
 /// A fake cmux app that serves what `cmux setup cloud-machine` and `cmux
 /// cloud kill-machine` ask: `auth.status`, `cloud.machines` (its
-/// `machines`, `creations`, `loaded` and `last_error`), and `action.run` of
-/// `newCloudMachine` (the person's card answers as `card`; a run with a key
-/// it answered before gets the same answer, as the app does) and of `cloud
+/// `machines`, `creations`, `last_error`, and `loaded` when set), and
+/// `action.run` of `newCloudMachine` (the person's card answers as `card`;
+/// a run with a key it answered before gets the same answer until a
+/// `restart`, as the app's in-memory cache does) and of `cloud
 /// kill-machine`, whose machine leaves the list. Every request is kept.
 struct FakeCloud {
     signed_in: Arc<AtomicBool>,
-    loaded: Arc<AtomicBool>,
+    /// The `loaded` field; None leaves it out, as the app does today.
+    loaded: Arc<Mutex<Option<bool>>>,
     last_error: Arc<Mutex<Value>>,
     card: Arc<Mutex<Card>>,
     machines: Arc<Mutex<Vec<Value>>>,
     creations: Arc<Mutex<Vec<Value>>>,
     /// Each card's answer, by the run's idempotency key.
     answers: Arc<Mutex<HashMap<String, Result<Value, Value>>>>,
+    /// Cards the person was shown.
+    shown: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<Value>>>,
 }
 
@@ -52,33 +63,39 @@ impl FakeCloud {
         world.app = Some(socket);
         let cloud = Self {
             signed_in: Arc::new(AtomicBool::new(true)),
-            loaded: Arc::new(AtomicBool::new(true)),
+            loaded: Arc::new(Mutex::new(None)),
             last_error: Arc::new(Mutex::new(Value::Null)),
             card: Arc::new(Mutex::new(Card::Allow)),
             machines: Arc::new(Mutex::new(Vec::new())),
             creations: Arc::new(Mutex::new(Vec::new())),
             answers: Arc::new(Mutex::new(HashMap::new())),
+            shown: Arc::new(AtomicUsize::new(0)),
             requests: Arc::new(Mutex::new(Vec::new())),
         };
-        let (signed_in, loaded, last_error, card, machines, creations, answers) = (
+        let (signed_in, loaded, last_error, card) = (
             cloud.signed_in.clone(),
             cloud.loaded.clone(),
             cloud.last_error.clone(),
             cloud.card.clone(),
+        );
+        let (machines, creations, answers, shown) = (
             cloud.machines.clone(),
             cloud.creations.clone(),
             cloud.answers.clone(),
+            cloud.shown.clone(),
         );
-        let made = AtomicUsize::new(0);
         serve_app(listener, cloud.requests.clone(), move |method, params| match method {
             "auth.status" => Some(Ok(json!({"signed_in": signed_in.load(Ordering::SeqCst),
                 "restoring": false, "cloud_unavailable": null}))),
             "cloud.machines" => {
                 let (rows, creations) =
                     (machines.lock().unwrap().clone(), creations.lock().unwrap().clone());
-                Some(Ok(json!({"machines": rows, "creations": creations,
-                    "loaded": loaded.load(Ordering::SeqCst),
-                    "last_error": *last_error.lock().unwrap()})))
+                let mut listing = json!({"machines": rows, "creations": creations,
+                    "last_error": *last_error.lock().unwrap()});
+                if let Some(loaded) = *loaded.lock().unwrap() {
+                    listing["loaded"] = json!(loaded);
+                }
+                Some(Ok(listing))
             }
             "action.run" if params["action"] == "newCloudMachine" => {
                 let key = params["idempotency_key"].as_str().unwrap_or_default().to_owned();
@@ -87,6 +104,10 @@ impl FakeCloud {
                     return Some(answer.clone());
                 }
                 let card = *card.lock().unwrap();
+                if card == Card::Lost {
+                    return None;
+                }
+                let n = shown.fetch_add(1, Ordering::SeqCst) + 1;
                 let refusal = |reason: &str| {
                     Err(json!({"code": "unavailable",
                         "message": format!("newCloudMachine unavailable: {reason}"),
@@ -95,24 +116,25 @@ impl FakeCloud {
                 let answer = match card {
                     Card::Decline => refusal(DECLINED),
                     Card::Refuse => refusal("Your plan allows no more Cloud machines."),
-                    Card::Allow | Card::Drop => {
-                        let id = format!("vm-{}", made.fetch_add(1, Ordering::SeqCst) + 1);
-                        machines
-                            .lock()
-                            .unwrap()
-                            .push(json!({"id": id, "title": "cmux", "status": "running"}));
+                    Card::Allow | Card::Drop | Card::Lost => {
+                        let id = format!("vm-{n}");
+                        let row = json!({"id": id, "title": "cmux", "status": "running"});
+                        machines.lock().unwrap().push(row);
                         Ok(json!({"action": "newCloudMachine", "ran": true, "result": {
                             "machine_id": id, "title": "cmux", "status": "provisioning",
                             "target": format!("machine:{id}")}}))
                     }
-                    Card::Slow => {
-                        let id = format!("cr-{}", made.fetch_add(1, Ordering::SeqCst) + 1);
-                        creations
-                            .lock()
-                            .unwrap()
-                            .push(json!({"id": id, "machine_id": null, "stage": "creating"}));
-                        Ok(json!({"action": "newCloudMachine", "ran": true, "result": {
-                            "pending": true, "status": "creating", "creation_id": id}}))
+                    Card::Slow | Card::Null => {
+                        let id = format!("cr-{n}");
+                        let row = json!({"id": id, "machine_id": null, "stage": "creating"});
+                        creations.lock().unwrap().push(row);
+                        let result = match card {
+                            Card::Slow => {
+                                json!({"pending": true, "status": "creating", "creation_id": id})
+                            }
+                            _ => Value::Null,
+                        };
+                        Ok(json!({"action": "newCloudMachine", "ran": true, "result": result}))
                     }
                 };
                 answers.insert(key, answer.clone());
@@ -141,10 +163,14 @@ impl FakeCloud {
         cloud
     }
 
-    /// How many cards the person was shown (a run sent again with its key
-    /// shows none).
+    /// How many cards the person was shown.
     fn cards(&self) -> usize {
-        self.answers.lock().unwrap().len()
+        self.shown.load(Ordering::SeqCst)
+    }
+
+    /// cmux restarts: it forgets every answer it gave a key.
+    fn restart(&self) {
+        self.answers.lock().unwrap().clear();
     }
 
     /// The idempotency key of every `newCloudMachine` run, in order.
@@ -158,18 +184,39 @@ impl FakeCloud {
     }
 }
 
+impl World {
+    /// Runs each command of a `&&` line the way the agent's shell does,
+    /// expecting each to succeed.
+    fn run_line(&self, line: &str) {
+        for command in line.split(" && ") {
+            let words = shell_words(command);
+            assert_eq!(words.first().map(String::as_str), Some("cmux"), "{line}");
+            let args = words[1..].iter().map(String::as_str).collect::<Vec<_>>();
+            let output = self.run(&args);
+            assert!(
+                output.status.success(),
+                "{command}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    fn cloud_check(&self) -> Value {
+        self.json(&["setup", "status"])["checks"][5].clone()
+    }
+}
+
 /// A Cloud machine driven the way an agent drives it: signed out is the
 /// person's sign-in, a dry run asks nothing, the person declines and then
 /// allows the machine on cmux's card, a rerun makes no second one, the
-/// undo kills it, and a run after that makes a new one.
+/// undo kills it and forgets it, and a run after that makes a new one.
 #[test]
 fn cmux_setup_cloud_machine_makes_one_with_the_persons_ok_and_never_a_second() {
     let mut world = World::new("cloud");
     let app = FakeCloud::start(&mut world);
 
-    let status = world.json(&["setup", "status"]);
-    let check = &status["checks"][5];
-    assert_eq!(check["task"], "cloud_machine", "{status}");
+    let check = world.cloud_check();
+    assert_eq!(check["task"], "cloud_machine", "{check}");
     assert_eq!(check["state"], "needs_setup", "{check}");
     let fix = check["fix"].as_str().expect("status names its fix").to_owned();
     assert_eq!(fix, "cmux setup cloud-machine");
@@ -197,41 +244,38 @@ fn cmux_setup_cloud_machine_makes_one_with_the_persons_ok_and_never_a_second() {
     *app.card.lock().unwrap() = Card::Allow;
     let made = world.follow(&fix);
     assert_eq!(made["state"], "changed", "{made}");
-    let machine = json!({"id": "vm-1", "title": "cmux", "status": "provisioning",
-        "target": "machine:vm-1"});
+    let machine = json!({"id": "vm-2", "title": "cmux", "status": "provisioning",
+        "target": "machine:vm-2"});
     assert_eq!(made["machine"], machine, "{made}");
+    assert_eq!(made["inferred"], Value::Null, "{made}");
     let undo = made["undo"].as_str().expect("a change names its undo").to_owned();
-    assert_eq!(undo, "cmux cloud kill-machine --target machine:vm-1 --confirm");
+    assert_eq!(
+        undo,
+        format!("cmux cloud kill-machine --target machine:vm-2 --confirm && {FORGET}")
+    );
     assert_eq!(app.cards(), 2);
 
     // A rerun reads the machine it made, in the same shape, and asks nothing.
     let again = world.follow(&fix);
     assert_eq!(again["state"], "ok", "{again}");
-    let running = json!({"id": "vm-1", "title": "cmux", "status": "running",
-        "target": "machine:vm-1"});
+    let running = json!({"id": "vm-2", "title": "cmux", "status": "running",
+        "target": "machine:vm-2"});
     assert_eq!(again["machine"], running, "{again}");
     assert_eq!(app.cards(), 2, "a rerun made a second machine");
-    let status = world.json(&["setup", "status"]);
-    let check = &status["checks"][5];
+    let check = world.cloud_check();
     assert_eq!(
         (&check["state"], &check["machine"]["id"]),
-        (&json!("ok"), &json!("vm-1")),
+        (&json!("ok"), &json!("vm-2")),
         "{check}"
     );
 
-    // The undo, as the agent's shell runs it, kills that machine.
-    let words = shell_words(&undo);
-    let args = words[1..].iter().map(String::as_str).collect::<Vec<_>>();
-    let output = world.run(&args);
-    assert!(output.status.success(), "{undo}: {}", String::from_utf8_lossy(&output.stderr));
+    // The undo, as the agent's shell runs it: the machine is killed and forgotten.
+    world.run_line(&undo);
     assert!(app.machines.lock().unwrap().is_empty());
-
-    // Its machine is gone, so setup makes a new one.
-    assert_eq!(world.json(&["setup", "status"])["checks"][5]["state"], "needs_setup");
+    assert_eq!(world.cloud_check()["state"], "needs_setup");
     let remade = world.follow(&fix);
     assert_eq!(remade["state"], "changed", "{remade}");
-    assert_eq!(remade["before"], json!({"id": "vm-1", "status": "gone"}), "{remade}");
-    assert_eq!(remade["machine"]["id"], "vm-2", "{remade}");
+    assert_eq!(remade["machine"]["id"], "vm-3", "{remade}");
     assert_eq!(app.cards(), 3);
 
     let output = world.run(&["setup", "cloud-machine", "now"]);
@@ -254,8 +298,8 @@ fn cmux_setup_cloud_machine_waits_for_a_slow_creation_instead_of_a_second() {
 
     let still = world.follow(&rerun);
     assert_eq!(still["user_action"]["kind"], "wait", "{still}");
-    assert_eq!(world.json(&["setup", "status"])["checks"][5]["user_action"]["kind"], "wait");
-    assert_eq!(app.cards(), 1, "a rerun asked for a second machine");
+    assert_eq!(world.cloud_check()["user_action"]["kind"], "wait");
+    assert_eq!(app.create_keys().len(), 1, "a rerun asked for a second machine");
 
     // The machine comes up; the creation names it.
     app.machines.lock().unwrap().push(json!({"id": "vm-9", "title": "cmux", "status": "running"}));
@@ -265,12 +309,16 @@ fn cmux_setup_cloud_machine_waits_for_a_slow_creation_instead_of_a_second() {
     assert_eq!((&looked["before"], &looked["undo"]), (&Value::Null, &Value::Null), "{looked}");
     let made = world.follow(&rerun);
     assert_eq!(made["state"], "changed", "{made}");
-    assert_eq!(made["machine"]["id"], "vm-9", "{made}");
-    assert_eq!(made["undo"], "cmux cloud kill-machine --target machine:vm-9 --confirm");
+    assert_eq!((&made["machine"]["id"], &made["inferred"]), (&json!("vm-9"), &Value::Null));
+    assert_eq!(
+        made["undo"],
+        format!("cmux cloud kill-machine --target machine:vm-9 --confirm && {FORGET}")
+    );
     assert_eq!(world.follow(&rerun)["state"], "ok");
     assert_eq!(app.cards(), 1);
 
-    // A creation that left the list once its workspace showed: the new machine is its.
+    // A creation that left the list once its workspace showed: the one new
+    // machine is its, and setup says it inferred that.
     let mut world = World::new("cloudgone");
     let app = FakeCloud::start(&mut world);
     *app.card.lock().unwrap() = Card::Slow;
@@ -279,39 +327,54 @@ fn cmux_setup_cloud_machine_waits_for_a_slow_creation_instead_of_a_second() {
     app.machines.lock().unwrap().push(json!({"id": "vm-5", "title": "cmux", "status": "running"}));
     let made = world.json(&["setup", "cloud-machine"]);
     assert_eq!(made["state"], "changed", "{made}");
-    assert_eq!(made["machine"]["id"], "vm-5", "{made}");
+    assert_eq!((&made["machine"]["id"], &made["inferred"]), (&json!("vm-5"), &json!(true)));
+    assert!(made["undo_note"].is_string(), "{made}");
     assert_eq!(app.cards(), 1);
 }
 
-/// A list cmux has not loaded, or could not read, decides nothing: the
-/// machine setup made is kept and nothing is asked. A machine on its way
-/// that setup did not ask for is waited for too.
+/// A list cmux could not read, has not loaded, or shows empty while setup
+/// has a machine on file, decides nothing: the machine setup made is kept
+/// and nothing is asked. Only a list that shows other machines says setup's
+/// is gone. A machine on its way that setup did not ask for is waited for.
 #[test]
 fn cmux_setup_cloud_machine_decides_nothing_off_a_list_cmux_has_not_loaded() {
     let mut world = World::new("cloudload");
     let app = FakeCloud::start(&mut world);
     assert_eq!(world.json(&["setup", "cloud-machine"])["state"], "changed");
 
-    // Before cmux's first refresh the list is empty.
+    // Before cmux's first refresh the list is empty, and says no more.
     let rows = std::mem::take(&mut *app.machines.lock().unwrap());
-    app.loaded.store(false, Ordering::SeqCst);
     let early = world.json(&["setup", "cloud-machine"]);
     assert_eq!(early["state"], "needs_user", "{early}");
     assert_eq!(early["user_action"]["kind"], "wait", "{early}");
-    assert_eq!(world.json(&["setup", "status"])["checks"][5]["user_action"]["kind"], "wait");
+    assert!(early["user_action"]["text"].as_str().unwrap().contains(FORGET), "{early}");
+    assert_eq!(world.cloud_check()["user_action"]["kind"], "wait");
+    *app.loaded.lock().unwrap() = Some(false);
+    assert_eq!(world.json(&["setup", "cloud-machine"])["user_action"]["kind"], "wait");
+    *app.loaded.lock().unwrap() = None;
 
     // A refresh that failed leaves the list as it was, and says so.
-    app.loaded.store(true, Ordering::SeqCst);
+    *app.machines.lock().unwrap() = rows;
     *app.last_error.lock().unwrap() = json!("The network connection was lost.");
     let failed = world.json(&["setup", "cloud-machine"]);
     assert_eq!(failed["user_action"]["kind"], "wait", "{failed}");
     assert_eq!(app.cards(), 1, "setup made a machine off a list it could not trust");
 
-    // Loaded again: setup's machine is still its own.
+    // Read again: setup's machine is still its own.
     *app.last_error.lock().unwrap() = Value::Null;
-    *app.machines.lock().unwrap() = rows;
     let back = world.json(&["setup", "cloud-machine"]);
     assert_eq!((&back["state"], &back["machine"]["id"]), (&json!("ok"), &json!("vm-1")), "{back}");
+
+    // A list with another machine and not setup's: setup's is gone, and the
+    // person's machine is enough.
+    *app.machines.lock().unwrap() = vec![json!({"id": "mine", "title": "x", "status": "paused"})];
+    let other = world.json(&["setup", "cloud-machine"]);
+    assert_eq!(other["state"], "ok", "{other}");
+    assert_eq!(other["before"], json!({"id": "vm-1", "status": "gone"}), "{other}");
+    assert_eq!(other["machine"]["id"], "mine", "{other}");
+    let note = other["note"].as_str().expect("a paused machine names its resume");
+    assert!(note.contains("cmux cloud resume-machine --target machine:mine"), "{note}");
+    assert_eq!(app.cards(), 1);
 
     // A machine the person started in cmux is on its way: no second one.
     let mut world = World::new("cloudtheirs");
@@ -319,36 +382,70 @@ fn cmux_setup_cloud_machine_decides_nothing_off_a_list_cmux_has_not_loaded() {
     app.creations.lock().unwrap().push(json!({"id": "c", "machine_id": null, "stage": "booting"}));
     let theirs = world.json(&["setup", "cloud-machine"]);
     assert_eq!(theirs["user_action"]["kind"], "wait", "{theirs}");
-    assert_eq!(world.json(&["setup", "status"])["checks"][5]["user_action"]["kind"], "wait");
+    assert_eq!(world.cloud_check()["user_action"]["kind"], "wait");
     assert_eq!(app.cards(), 0);
 }
 
-/// A create whose answer never came back: the key was kept before it was
-/// sent, so the rerun sends it again and the app answers the one machine it
-/// made, with no second card.
+/// A create whose answer never came back is decided from the list first:
+/// a machine made while cmux then restarted (and forgot the key) is
+/// adopted, never made twice; only when nothing new appeared, on a list cmux
+/// says it loaded, is the create sent again with its key.
 #[test]
-fn cmux_setup_cloud_machine_sends_an_unanswered_create_again_with_its_key() {
+fn cmux_setup_cloud_machine_reads_the_list_before_sending_a_create_again() {
+    // The answer was lost and cmux restarted: the new machine is setup's.
     let mut world = World::new("clouddrop");
     let app = FakeCloud::start(&mut world);
     *app.card.lock().unwrap() = Card::Drop;
     let lost = world.json(&["setup", "cloud-machine"]);
-    assert_eq!(lost["state"], "needs_user", "{lost}");
     assert_eq!(lost["user_action"]["kind"], "wait", "{lost}");
-    assert_eq!(world.json(&["setup", "status"])["checks"][5]["user_action"]["kind"], "wait");
-
+    // Status already reads the machine that appeared, and writes nothing.
+    assert_eq!(world.cloud_check()["machine"]["id"], "vm-1");
+    app.restart();
     *app.card.lock().unwrap() = Card::Allow;
+    let adopted = world.json(&["setup", "cloud-machine"]);
+    assert_eq!(adopted["state"], "changed", "{adopted}");
+    assert_eq!((&adopted["machine"]["id"], &adopted["inferred"]), (&json!("vm-1"), &json!(true)));
+    assert_eq!(app.create_keys().len(), 1, "the create was sent again");
+    assert_eq!(app.cards(), 1, "the person saw a second card");
+    assert_eq!(world.json(&["setup", "cloud-machine"])["state"], "ok");
+
+    // No result at all, and a restart: the creation it started is waited for.
+    let mut world = World::new("cloudnull");
+    let app = FakeCloud::start(&mut world);
+    *app.card.lock().unwrap() = Card::Null;
+    assert_eq!(world.json(&["setup", "cloud-machine"])["user_action"]["kind"], "wait");
+    app.restart();
+    let on_its_way = world.json(&["setup", "cloud-machine"]);
+    assert_eq!(on_its_way["user_action"]["kind"], "wait", "{on_its_way}");
+    app.machines.lock().unwrap().push(json!({"id": "vm-7", "title": "cmux", "status": "running"}));
+    app.creations.lock().unwrap()[0]["machine_id"] = json!("vm-7");
     let made = world.json(&["setup", "cloud-machine"]);
     assert_eq!(made["state"], "changed", "{made}");
-    assert_eq!(made["machine"]["id"], "vm-1", "{made}");
+    assert_eq!((&made["machine"]["id"], &made["inferred"]), (&json!("vm-7"), &Value::Null));
+    assert_eq!(app.create_keys().len(), 1, "the create was sent again");
+    assert_eq!(app.cards(), 1);
+
+    // The request never reached cmux: on an empty list setup waits; once
+    // cmux says it loaded the list, the create goes again with its key.
+    let mut world = World::new("cloudlost");
+    let app = FakeCloud::start(&mut world);
+    *app.card.lock().unwrap() = Card::Lost;
+    assert_eq!(world.json(&["setup", "cloud-machine"])["user_action"]["kind"], "wait");
+    *app.card.lock().unwrap() = Card::Allow;
+    assert_eq!(world.json(&["setup", "cloud-machine"])["user_action"]["kind"], "wait");
+    assert_eq!(app.create_keys().len(), 1, "sent again off an empty list");
+    *app.loaded.lock().unwrap() = Some(true);
+    let made = world.json(&["setup", "cloud-machine"]);
+    assert_eq!(made["state"], "changed", "{made}");
     let keys = app.create_keys();
     assert_eq!(keys.len(), 2, "{keys:?}");
     assert!(keys[0].is_string() && keys[0] == keys[1], "a new key: {keys:?}");
-    assert_eq!(app.cards(), 1, "the person saw a second card");
-    assert_eq!(world.json(&["setup", "cloud-machine"])["state"], "ok");
+    assert_eq!(app.cards(), 1);
 }
 
 /// A refusal that is not the person's decline (a plan with no room) is the
-/// app's to say, and the next run asks afresh.
+/// app's to say; setup keeps the request, so reruns make nothing, and
+/// `--forget` lets it ask afresh.
 #[test]
 fn cmux_setup_cloud_machine_names_a_plan_refusal_as_the_apps() {
     let mut world = World::new("cloudplan");
@@ -360,9 +457,16 @@ fn cmux_setup_cloud_machine_names_a_plan_refusal_as_the_apps() {
     assert_eq!(action["kind"], "app", "{refused}");
     let text = action["text"].as_str().unwrap();
     assert!(text.contains("Your plan allows no more Cloud machines."), "{text}");
+    assert!(text.contains(FORGET), "{text}");
+    assert_eq!(world.json(&["setup", "cloud-machine"])["user_action"]["kind"], "wait");
+    assert_eq!(app.create_keys().len(), 1);
 
     *app.card.lock().unwrap() = Card::Allow;
+    let forgot = world.json(&["setup", "cloud-machine", "--forget"]);
+    assert_eq!(forgot["state"], "changed", "{forgot}");
+    assert!(forgot["before"]["key"].is_string(), "{forgot}");
+    assert_eq!(world.json(&["setup", "cloud-machine", "--forget"])["state"], "ok");
     assert_eq!(world.json(&["setup", "cloud-machine"])["state"], "changed");
     let keys = app.create_keys();
-    assert_ne!(keys[0], keys[1], "a refused create was sent again: {keys:?}");
+    assert_ne!(keys[0], keys[1], "the refused create was sent again: {keys:?}");
 }
