@@ -1,3 +1,4 @@
+// cmux-web-test-timeout: 900
 // New Tab lists move with their rows (motion pass, 2026-10-12): when a tab closes, its row joins
 // Recently Closed at the top and the rows under it slide down from where they were drawn, instead
 // of every row jumping a slot in one frame; the new row fades in where it lands. Reduced motion
@@ -39,17 +40,33 @@ await requireBrowserLane("new-tab-list-motion.test.ts", async () => {
     }
   }
 
+  const probeEvents: string[] = [];
+  const burners: import("node:child_process").ChildProcess[] = [];
   beforeAll(async () => {
+    const { spawn } = await import("node:child_process");
+    const os = await import("node:os");
     vite = await createServer({
       configFile: path.join(webviews, "vite.config.gallery-dev.ts"),
       server: { port: 0, host: "127.0.0.1", strictPort: false },
       logLevel: "error",
     });
     await vite.listen();
+    const t0 = Date.now();
+    const hot = vite.environments.client.hot;
+    const send = hot.send.bind(hot) as (...args: unknown[]) => void;
+    hot.send = ((...args: unknown[]) => {
+      probeEvents.push(`PROBE +${Date.now() - t0}ms hot.send ${JSON.stringify(args[0]).slice(0, 300)}`);
+      send(...args);
+    }) as typeof hot.send;
+    vite.watcher.on("all", (event, file) => probeEvents.push(`PROBE +${Date.now() - t0}ms watch ${event} ${file}`));
     browser = await chromium.launch({ headless: true });
     await warmGalleryFrame(vite, "agent-pane.new-tab", { browser, params: { variant: "recently-closed" } });
+    probeEvents.push(`PROBE +${Date.now() - t0}ms warmed`);
+    for (let index = 0; index < os.cpus().length; index++)
+      burners.push(spawn(process.execPath, ["-e", "for(;;){}"], { stdio: "ignore" }));
   });
   afterAll(async () => {
+    for (const burner of burners) burner.kill("SIGKILL");
     await browser?.close();
     await vite?.close();
   });
@@ -58,6 +75,13 @@ await requireBrowserLane("new-tab-list-motion.test.ts", async () => {
    * CSS transitions), so a short fade that ends before the test reads is still counted. */
   async function recordingPage() {
     const page = await browser!.newPage({ viewport: { width: 900, height: 700 } });
+    page.on("framenavigated", (frame) => {
+      if (frame === page.mainFrame()) probeEvents.push(`PROBE navigated ${frame.url().slice(0, 120)}`);
+    });
+    page.on("console", (message) => {
+      if (/vite|reload|gallery/i.test(message.text()))
+        probeEvents.push(`PROBE console ${message.text().slice(0, 200)}`);
+    });
     await page.addInitScript(() => {
       type Started = { target: Element; properties: string[] };
       const started: Started[] = [];
@@ -130,41 +154,47 @@ await requireBrowserLane("new-tab-list-motion.test.ts", async () => {
     });
   }
 
-  test("a closed tab's row fades in at the top and the rows under it slide down", async () => {
-    const page = await open(false);
-    try {
-      await closed(page, ["a", "b", "c", "d"]);
-      await page.waitForTimeout(400); // the first rows settle
-      await forget(page);
-      await closed(page, ["e", "a", "b", "c", "d"]);
-      expect(await motion(page)).toEqual({
-        "Closed e": ["opacity"],
-        "Closed a": ["transform"],
-        "Closed b": ["transform"],
-        "Closed c": ["transform"],
-        "Closed d": ["transform"],
-      });
-    } finally {
-      await page.close();
-    }
-  });
+  for (const round of [1, 2, 3, 4, 5]) {
+    test(`${round} a closed tab's row fades in at the top and the rows under it slide down`, async () => {
+      const page = await open(false);
+      try {
+        await closed(page, ["a", "b", "c", "d"]);
+        await page.waitForTimeout(400); // the first rows settle
+        await forget(page);
+        await closed(page, ["e", "a", "b", "c", "d"]);
+        expect(await motion(page)).toEqual({
+          "Closed e": ["opacity"],
+          "Closed a": ["transform"],
+          "Closed b": ["transform"],
+          "Closed c": ["transform"],
+          "Closed d": ["transform"],
+        });
+      } finally {
+        await page.close();
+      }
+    });
 
-  test("with reduced motion the new row still fades in and nothing slides", async () => {
-    const page = await open(true);
-    try {
-      await closed(page, ["a", "b", "c", "d"]);
-      await page.waitForTimeout(400); // the first rows settle
-      await forget(page);
-      await closed(page, ["e", "a", "b", "c", "d"]);
-      expect(await motion(page)).toEqual({
-        "Closed e": ["opacity"],
-        "Closed a": [],
-        "Closed b": [],
-        "Closed c": [],
-        "Closed d": [],
-      });
-    } finally {
-      await page.close();
-    }
+    test(`${round} with reduced motion the new row still fades in and nothing slides`, async () => {
+      const page = await open(true);
+      try {
+        await closed(page, ["a", "b", "c", "d"]);
+        await page.waitForTimeout(400); // the first rows settle
+        await forget(page);
+        await closed(page, ["e", "a", "b", "c", "d"]);
+        expect(await motion(page)).toEqual({
+          "Closed e": ["opacity"],
+          "Closed a": [],
+          "Closed b": [],
+          "Closed c": [],
+          "Closed d": [],
+        });
+      } finally {
+        await page.close();
+      }
+    });
+  }
+  test("probe: no reloads", () => {
+    console.warn(probeEvents.join("\n"));
+    expect(probeEvents.filter((line) => !line.includes("navigated"))).toEqual([]);
   });
 });
