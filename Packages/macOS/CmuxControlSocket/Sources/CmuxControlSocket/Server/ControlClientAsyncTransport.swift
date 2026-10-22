@@ -57,9 +57,6 @@ public final class ControlClientAsyncLineReader: @unchecked Sendable {
     private var awaitsCodeRouterHandoffCompletion = false
     private var codeRouterCompletionDeadlineUptimeNanoseconds: UInt64?
     private var codeRouterCompletionDeadlineTask: Task<Void, Never>?
-    private var currentLineMethodIsCodeRouter: Bool?
-    private var lateRouteScanState = ControlClientLineReader.LateRouteScanState()
-    private var lateRouteScanIndex = 0
     private var pendingBytes: [UInt8] = []
     private var pendingStartIndex = 0
     private var newlineSearchIndex = 0
@@ -236,24 +233,28 @@ public final class ControlClientAsyncLineReader: @unchecked Sendable {
     ) async -> String? {
         guard !didCompleteCodeRouterHandshake else { return nil }
         while !Task.isCancelled {
-            guard deadlineHasNotExpired, shouldContinueReading(),
-                  currentLineIsWithinCodeRouterHandshakeLimit else { return nil }
+            guard deadlineHasNotExpired, shouldContinueReading() else { return nil }
 
             if let newlineIndex = nextBareNewlineIndex() {
-                let completedHandshake = currentLineMethodIsCodeRouter == true
                 let wasAwaitingCompletion = awaitsCodeRouterHandoffCompletion
                 let consumedByteCount = newlineIndex + 1 - pendingStartIndex
-                let decoded = String(
-                    bytes: pendingBytes[pendingStartIndex..<newlineIndex],
-                    encoding: .utf8
-                )
+                let lineBytes = pendingBytes[pendingStartIndex..<newlineIndex]
+                let isWithinCodeRouterLimit = codeRouterHandshakeMaximumBytes.map {
+                    consumedByteCount <= $0
+                } ?? true
+                let methodIsCodeRouter = codeRouterHandshakeMaximumBytes == nil
+                    ? nil
+                    : ControlClientLineReader.classifyTopLevelMethod(in: lineBytes)
+                guard !wasAwaitingCompletion || isWithinCodeRouterLimit else { return nil }
+                if !isWithinCodeRouterLimit, methodIsCodeRouter != false { return nil }
+                let completedHandshake = isWithinCodeRouterLimit
+                    && codeRouterHandshakeMaximumBytes != nil
+                    && methodIsCodeRouter == true
+                let decoded = String(bytes: lineBytes, encoding: .utf8)
                 pendingStartIndex = newlineIndex + 1
                 newlineSearchIndex = pendingStartIndex
                 releasePendingBytes(consumedByteCount)
                 compactPendingBytesIfNeeded()
-                currentLineMethodIsCodeRouter = nil
-                lateRouteScanState = ControlClientLineReader.LateRouteScanState()
-                lateRouteScanIndex = pendingStartIndex
                 didCompleteCodeRouterHandshake = wasAwaitingCompletion || completedHandshake
                 if wasAwaitingCompletion {
                     awaitsCodeRouterHandoffCompletion = false
@@ -336,25 +337,6 @@ public final class ControlClientAsyncLineReader: @unchecked Sendable {
         }
     }
 
-    /// Share the blocking reader's pre-JSON route classification. A large
-    /// ordinary request stays allowed; late duplicate/escaped route keys fail
-    /// closed before any JSON decoding, and handoff frames remain 4 KiB.
-    private var currentLineIsWithinCodeRouterHandshakeLimit: Bool {
-        guard let maximum = codeRouterHandshakeMaximumBytes else { return true }
-        let newline = pendingBytes[pendingStartIndex...].firstIndex(of: 0x0A)
-        let end = newline ?? pendingBytes.endIndex
-        let prefix = Array(pendingBytes[pendingStartIndex..<end].prefix(maximum + 1))
-        currentLineMethodIsCodeRouter = ControlClientLineReader.classifyTopLevelMethod(in: prefix)
-        let rawCount = end - pendingStartIndex + (newline == nil ? 0 : 1)
-        guard rawCount > maximum else { return true }
-        guard !awaitsCodeRouterHandoffCompletion, currentLineMethodIsCodeRouter == false else { return false }
-        while lateRouteScanIndex < end {
-            let byte = pendingBytes[lateRouteScanIndex]
-            lateRouteScanIndex += 1
-            if lateRouteScanState.consume(byte) { return false }
-        }
-        return true
-    }
 
     private var deadlineHasNotExpired: Bool {
         let now = monotonicNowNanoseconds()

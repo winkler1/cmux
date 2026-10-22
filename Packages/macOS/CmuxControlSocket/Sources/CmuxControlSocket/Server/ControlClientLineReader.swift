@@ -389,7 +389,9 @@ public final class ControlClientLineReader {
     /// `{"padding":"\\\"method\\\":\\\"normal\\\""}` from disabling the
     /// CodeRouter cap. Escaped keys and values stay undecided and fail closed
     /// at the cap.
-    static func classifyTopLevelMethod(in bytes: [UInt8]) -> Bool? {
+    static func classifyTopLevelMethod<Bytes: Collection>(
+        in bytes: Bytes
+    ) -> Bool? where Bytes.Element == UInt8, Bytes.Index == Int {
         guard let commandStart = bytes.firstIndex(where: {
             !Self.isASCIIWhitespace($0)
         }) else {
