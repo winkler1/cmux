@@ -29,6 +29,8 @@ public final class UpdateController {
     /// Whether the running build is a cmux DEV/staging build that must never be compared against
     /// the public release appcast. See ``isDevLikeBundleIdentifier(_:)``.
     let isDevLikeBundle: Bool
+    /// Whether updates are owned by an external package manager rather than Sparkle.
+    let updatesManagedExternally: Bool
 
     /// Host actions the updater delegates upward (retry, relaunch prep). Forwarded to the driver.
     public weak var actionDelegate: (any UpdateActionDelegate)? {
@@ -78,6 +80,8 @@ public final class UpdateController {
     ///   - isDevLikeBundle: Overrides whether this is a DEV/staging build. Defaults to `nil`,
     ///     which derives it from `hostBundle.bundleIdentifier` via ``isDevLikeBundleIdentifier(_:)``.
     ///     Injectable because a `Bundle` with an arbitrary identifier cannot be constructed in tests.
+    ///   - updatesManagedExternally: Overrides whether updates are managed outside cmux. Defaults
+    ///     to the `CMUXUpdatesManagedExternally` value in the host bundle's Info.plist.
     /// - Parameter isDisabledByPolicy: The host's `DisableAutoUpdate` managed
     ///   policy. While it returns true the updater is never started and manual
     ///   checks are suppressed; the package stays free of the settings
@@ -89,6 +93,7 @@ public final class UpdateController {
                             defaults: UserDefaults = .standard,
                             fileManager: FileManager = .default,
                             isDevLikeBundle: Bool? = nil,
+                            updatesManagedExternally: Bool? = nil,
                             isDisabledByPolicy: @escaping () -> Bool = { false }) {
         self.init(log: log,
                   clock: clock,
@@ -97,6 +102,7 @@ public final class UpdateController {
                   defaults: defaults,
                   fileManager: fileManager,
                   isDevLikeBundle: isDevLikeBundle,
+                  updatesManagedExternally: updatesManagedExternally,
                   isDisabledByPolicy: isDisabledByPolicy,
                   updaterFactory: { driver, hostBundle in
                       SPUUpdater(
@@ -121,6 +127,7 @@ public final class UpdateController {
          defaults: UserDefaults = .standard,
          fileManager: FileManager = .default,
          isDevLikeBundle: Bool? = nil,
+         updatesManagedExternally: Bool? = nil,
          isDisabledByPolicy: @escaping () -> Bool = { false },
          updaterFactory: (UpdateDriver, Bundle) -> any UpdaterHandle) {
         self.log = log
@@ -131,6 +138,9 @@ public final class UpdateController {
         self.hostBundle = hostBundle
         let isDevLikeBundle = isDevLikeBundle ?? Self.isDevLikeBundleIdentifier(hostBundle.bundleIdentifier)
         self.isDevLikeBundle = isDevLikeBundle
+        let externallyManaged = updatesManagedExternally
+            ?? Self.isExternallyManagedUpdateBuild(infoDictionary: hostBundle.infoDictionary ?? [:])
+        self.updatesManagedExternally = externallyManaged
         settings.apply(to: defaults)
         if isDevLikeBundle {
             // DEV (`com.cmuxterm.app.debug[.<tag>]`) and staging (`com.cmuxterm.app.staging[.<tag>]`)
@@ -259,6 +269,10 @@ public final class UpdateController {
     @discardableResult
     func startUpdaterIfNeeded(retryAfterFailure: @escaping () -> Void) -> Bool {
         guard !didStartUpdater else { return true }
+        if updatesManagedExternally {
+            log.append("updater not started (updates managed externally)")
+            return false
+        }
         if isDisabledByPolicy() {
             // Never start Sparkle: no scheduled checks, no launch probe, no
             // downloads. Manual checks are suppressed in `requestUpdateCheck`.
@@ -386,6 +400,14 @@ public final class UpdateController {
 }
 
 extension UpdateController {
+    static let updatesManagedExternallyInfoKey = "CMUXUpdatesManagedExternally"
+
+    /// Whether this bundle delegates updates to a package manager instead of Sparkle.
+    static func isExternallyManagedUpdateBuild(infoDictionary: [String: Any]) -> Bool {
+        guard let value = infoDictionary[updatesManagedExternallyInfoKey] as? String else { return false }
+        return value.caseInsensitiveCompare("YES") == .orderedSame
+    }
+
     /// Whether `bundleIdentifier` is a cmux DEV (`com.cmuxterm.app.debug[.<tag>]`) or staging
     /// (`com.cmuxterm.app.staging[.<tag>]`) build.
     ///

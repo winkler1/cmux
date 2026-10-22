@@ -295,6 +295,8 @@
 	</array>
 	<key>OSAScriptingDefinition</key>
 	<string>cmux.sdef</string>
+	<key>CMUXUpdatesManagedExternally</key>
+	<string>$(CMUX_UPDATES_MANAGED_EXTERNALLY)</string>
 	<key>SUAutomaticallyUpdate</key>
 	<false/>
 	<key>SUEnableAutomaticChecks</key>

@@ -13,6 +13,10 @@ extension UpdateController {
     /// surfaced, so a newer release published in the meantime is installed directly rather than
     /// prompting the user again right after relaunch (issue #6366).
     public func attemptUpdate() {
+        guard !updatesManagedExternally else {
+            requestUpdateCheck(.installLatest)
+            return
+        }
         model.discardPendingChanges()
         let action = attemptCoordinator.requestInstallLatest(currentState: model.state)
         if action == .startFreshCheck {

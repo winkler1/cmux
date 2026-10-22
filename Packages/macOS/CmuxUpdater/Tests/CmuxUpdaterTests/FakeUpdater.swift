@@ -3,6 +3,7 @@ import Foundation
 
 @MainActor
 final class FakeUpdater: UpdaterHandle {
+    private(set) var startCallCount = 0
     private(set) var checkForUpdatesCallCount = 0
     private var canCheckForUpdatesValue = true
     var scriptedCanCheckForUpdates: [Bool] = []
@@ -26,6 +27,7 @@ final class FakeUpdater: UpdaterHandle {
     var updateCheckInterval: TimeInterval = 3600
 
     func start() throws {
+        startCallCount += 1
         if let startError { throw startError }
     }
 

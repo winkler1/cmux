@@ -31,6 +31,17 @@ extension UpdateController {
             break
         }
 
+        if updatesManagedExternally {
+            log.append("manual update check suppressed (updates managed externally, intent=\(intent.rawValue))")
+            cancelReadinessRetry()
+            pendingCheckIntent = nil
+            activeCheckIntent = nil
+            attemptCoordinator.cancel()
+            installWatchdog.disarm()
+            model.setState(.notFound(.init(acknowledgement: {})))
+            return
+        }
+
         if isDisabledByPolicy() {
             // `DisableAutoUpdate` (MDM): the host explains the managed state
             // before asking; nothing here may touch the appcast.
